@@ -33,18 +33,75 @@ if (!fs.existsSync(dataDir)) {
 const exportPath = path.join(dataDir, 'export.jsonl');
 const dbPath = path.join(dataDir, 'ec.sqlite');
 
-console.log(`[elixir-context] Exporting from ${projectRoot}`);
+// Export Elixir files
+console.log(`[elixir-context] Exporting Elixir files from ${projectRoot}`);
 const exportRes = spawnSync('bash', ['-lc', `cd ${projectRoot} && mix run '${exporter}' --quiet --out '${exportPath}'`], { stdio: 'inherit' });
 if (exportRes.status !== 0) {
-  console.error('[elixir-context] Export failed');
+  console.error('[elixir-context] Elixir export failed');
   process.exit(exportRes.status || 1);
 }
 
+// Export .heex templates
+console.log(`[elixir-context] Exporting .heex templates`);
+const parseHeex = require('./parse-heex');
+
+function findHeexFiles(dir, fileList = []) {
+  const files = fs.readdirSync(dir);
+
+  for (const file of files) {
+    const filePath = path.join(dir, file);
+    const stat = fs.statSync(filePath);
+
+    if (stat.isDirectory()) {
+      // Skip deps, build, and node_modules directories
+      if (!['deps', '_build', 'node_modules', '.git'].includes(file)) {
+        findHeexFiles(filePath, fileList);
+      }
+    } else if (file.endsWith('.heex')) {
+      const relativePath = path.relative(projectRoot, filePath);
+      fileList.push(relativePath);
+    }
+  }
+
+  return fileList;
+}
+
+const heexFiles = findHeexFiles(projectRoot);
+const heexExportPath = path.join(dataDir, 'heex_export.jsonl');
+const heexStream = fs.createWriteStream(heexExportPath);
+
+for (const heexFile of heexFiles) {
+  try {
+    const fullPath = path.join(projectRoot, heexFile);
+    const content = fs.readFileSync(fullPath, 'utf8');
+    const results = parseHeex.parseHeexFile(heexFile, content);
+
+    for (const result of results) {
+      heexStream.write(JSON.stringify(result) + '\n');
+    }
+  } catch (err) {
+    console.error(`Failed to parse ${heexFile}:`, err.message);
+  }
+}
+
+heexStream.end();
+console.log(`[elixir-context] Exported ${heexFiles.length} template files`);
+
+// Ingest everything
 console.log(`[elixir-context] Ingesting into ${dbPath}`);
 const ingestRes = spawnSync('node', [path.resolve(__dirname, 'ingest.js'), exportPath, dbPath], { stdio: 'inherit' });
 if (ingestRes.status !== 0) {
   console.error('[elixir-context] Ingest failed');
   process.exit(ingestRes.status || 1);
+}
+
+// Ingest heex if file exists and has content
+if (fs.existsSync(heexExportPath) && fs.statSync(heexExportPath).size > 0) {
+  const heexIngestRes = spawnSync('node', [path.resolve(__dirname, 'ingest.js'), heexExportPath, dbPath], { stdio: 'inherit' });
+  if (heexIngestRes.status !== 0) {
+    console.error('[elixir-context] Heex ingest failed');
+    process.exit(heexIngestRes.status || 1);
+  }
 }
 
 console.log('[elixir-context] Build complete.');
