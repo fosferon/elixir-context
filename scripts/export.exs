@@ -115,22 +115,32 @@ defmodule Exporter do
   end
 
   def extract_from_module(body, module_name, file, _module_line, acc) do
-    safe_prewalk(body, acc, fn
-      {:def, meta, [{name, _, args}, _body_list]} = node, acc when is_atom(name) ->
-        def_info = extract_def_info(node, meta, name, args || [], module_name, file, :public)
-        {node, [def_info | acc]}
+    # Collect attributes (doc, spec) and associate with functions
+    {_, {defs, _attrs}} = safe_prewalk_with_attrs(body, {[], %{}}, fn
+      {:@, _, [{:doc, _, [doc_string]}]} = node, {defs, attrs} ->
+        {node, {defs, Map.put(attrs, :pending_doc, doc_string)}}
 
-      {:defp, meta, [{name, _, args}, _body_list]} = node, acc when is_atom(name) ->
-        def_info = extract_def_info(node, meta, name, args || [], module_name, file, :private)
-        {node, [def_info | acc]}
+      {:@, _, [{:spec, _, spec_ast}]} = node, {defs, attrs} ->
+        spec_text = Macro.to_string({:spec, [], spec_ast})
+        {node, {defs, Map.put(attrs, :pending_spec, spec_text)}}
 
-      {:defmacro, meta, [{name, _, args}, _body_list]} = node, acc when is_atom(name) ->
-        def_info = extract_def_info(node, meta, name, args || [], module_name, file, :macro)
-        {node, [def_info | acc]}
+      {:def, meta, [{name, _, args}, body_list]} = node, {defs, attrs} when is_atom(name) ->
+        def_info = extract_def_info(node, meta, name, args || [], module_name, file, :public, attrs, body_list)
+        {node, {[def_info | defs], %{}}}
+
+      {:defp, meta, [{name, _, args}, body_list]} = node, {defs, attrs} when is_atom(name) ->
+        def_info = extract_def_info(node, meta, name, args || [], module_name, file, :private, attrs, body_list)
+        {node, {[def_info | defs], %{}}}
+
+      {:defmacro, meta, [{name, _, args}, body_list]} = node, {defs, attrs} when is_atom(name) ->
+        def_info = extract_def_info(node, meta, name, args || [], module_name, file, :macro, attrs, body_list)
+        {node, {[def_info | defs], %{}}}
 
       node, acc ->
         {node, acc}
     end)
+
+    {body, defs ++ acc}
   end
 
   def safe_prewalk(ast, acc, fun) do
@@ -147,17 +157,42 @@ defmodule Exporter do
     end
   end
 
-  def extract_def_info(node, meta, name, args, module_name, file, _type) do
+  def safe_prewalk_with_attrs(ast, acc, fun) do
+    {ast, acc} = fun.(ast, acc)
+    case ast do
+      list when is_list(list) ->
+        {list, acc} = Enum.map_reduce(list, acc, &safe_prewalk_with_attrs(&1, &2, fun))
+        {list, acc}
+      {name, meta, args} when is_list(args) ->
+        {args, acc} = Enum.map_reduce(args, acc, &safe_prewalk_with_attrs(&1, &2, fun))
+        {{name, meta, args}, acc}
+      _ ->
+        {ast, acc}
+    end
+  end
+
+  def extract_def_info(node, meta, name, args, module_name, file, _type, attrs \\ %{}, body_list \\ nil) do
     args_list = if is_list(args), do: args, else: []
     arity = length(args_list)
     start_line = meta[:line] || 1
     end_line = meta[:end_line] || start_line
 
     signature = "#{name}(#{Enum.map_join(args_list, ", ", &Macro.to_string/1)})"
-    spec = nil  # TODO: extract @spec
-    doc = nil   # TODO: extract @doc
+    spec = Map.get(attrs, :pending_spec)
+    doc = Map.get(attrs, :pending_doc)
 
-    lexical_text = "#{module_name}.#{signature}"
+    # Extract keywords from body (atoms, important identifiers)
+    body_keywords = if body_list, do: extract_body_keywords(body_list, 30), else: []
+
+    # Build enriched lexical_text
+    lexical_parts = [
+      "#{module_name}.#{signature}",
+      doc,
+      spec,
+      Enum.join(body_keywords, " ")
+    ]
+    lexical_text = lexical_parts |> Enum.reject(&is_nil/1) |> Enum.join(" ")
+
     struct_text = Macro.to_string(node)
 
     calls = extract_calls(node)
@@ -185,11 +220,11 @@ defmodule Exporter do
 
   def extract_calls(node) do
     Macro.prewalk(node, [], fn
-      {{:., _, [module, func]}, meta, args} = call, acc when is_list(args) ->
+      {{:., _, [module, func]}, _meta, args} = call, acc when is_list(args) ->
         mfa = "#{module_to_string(module)}.#{func}/#{length(args)}"
         {call, [mfa | acc]}
 
-      {{:., _, [func]}, meta, args} = call, acc when is_list(args) and is_atom(func) ->
+      {{:., _, [func]}, _meta, args} = call, acc when is_list(args) and is_atom(func) ->
         mfa = "#{func}/#{length(args)}"
         {call, [mfa | acc]}
 
@@ -206,6 +241,40 @@ defmodule Exporter do
 
   def module_to_string(atom) when is_atom(atom), do: to_string(atom)
   def module_to_string(other), do: Macro.to_string(other)
+
+  def extract_body_keywords(body, limit \\ 30) do
+    # Extract important keywords from function body for better searchability
+    Macro.prewalk(body, [], fn
+      # Atoms (often represent important concepts like :ok, :error, :user, etc.)
+      atom, acc when is_atom(atom) and atom not in [nil, true, false, :do, :end, :when, :fn] ->
+        {atom, [to_string(atom) | acc]}
+
+      # Variables in pattern matching
+      {name, _, context} = node, acc when is_atom(name) and is_atom(context) ->
+        name_str = to_string(name)
+        # Skip common/noise variables
+        if name_str not in ["_", "x", "y", "opts", "state", "acc"] and not String.starts_with?(name_str, "_") do
+          {node, [name_str | acc]}
+        else
+          {node, acc}
+        end
+
+      # String literals (might contain important search terms)
+      string, acc when is_binary(string) and byte_size(string) > 3 and byte_size(string) < 50 ->
+        # Only include if alphanumeric (skip interpolations, etc.)
+        if String.match?(string, ~r/^[a-zA-Z_][a-zA-Z0-9_]*$/) do
+          {string, [string | acc]}
+        else
+          {string, acc}
+        end
+
+      node, acc ->
+        {node, acc}
+    end)
+    |> elem(1)
+    |> Enum.uniq()
+    |> Enum.take(limit)
+  end
 end
 
 Exporter.main(System.argv())
