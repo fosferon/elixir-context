@@ -82,21 +82,30 @@ const transaction = db.transaction(() => {
     if (!line.trim()) continue;
     const func = JSON.parse(line);
 
-    // Insert function
-    insertFunction.run(
-      func.id,
-      func.module,
-      func.name,
-      func.arity,
-      func.path,
-      func.start_line,
-      func.end_line || null,
-      func.signature,
-      func.spec,
-      func.doc,
-      func.lexical_text,
-      func.struct_text
-    );
+    // Ensure all fields are proper types (convert arrays/objects to strings or null)
+    const spec = (typeof func.spec === 'string' || func.spec === null) ? func.spec : JSON.stringify(func.spec);
+    const doc = (typeof func.doc === 'string' || func.doc === null) ? func.doc : JSON.stringify(func.doc);
+
+    try {
+      // Insert function
+      insertFunction.run(
+        func.id,
+        func.module,
+        func.name,
+        func.arity,
+        func.path,
+        func.start_line,
+        func.end_line || null,
+        func.signature,
+        spec,
+        doc,
+        func.lexical_text,
+        func.struct_text
+      );
+    } catch (err) {
+      console.error(`Error inserting function ${func.module}.${func.name}/${func.arity}:`, err.message);
+      throw err;
+    }
 
     // Insert FTS
     insertFts.run(func.id, func.lexical_text);
@@ -113,3 +122,4 @@ transaction();
 console.log(`Ingested ${lines.length} functions`);
 
 db.close();
+}
