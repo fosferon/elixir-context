@@ -35,7 +35,7 @@ const dbPath = path.join(dataDir, 'ec.sqlite');
 
 // Export Elixir files
 console.log(`[elixir-context] Exporting Elixir files from ${projectRoot}`);
-const exportRes = spawnSync('bash', ['-lc', `cd ${projectRoot} && mix run '${exporter}' --quiet --out '${exportPath}'`], { stdio: 'inherit' });
+const exportRes = spawnSync('bash', ['-lc', `cd ${projectRoot} && mix run --no-start '${exporter}' --quiet --out '${exportPath}'`], { stdio: 'inherit' });
 if (exportRes.status !== 0) {
   console.error('[elixir-context] Elixir export failed');
   process.exit(exportRes.status || 1);
@@ -46,21 +46,36 @@ console.log(`[elixir-context] Exporting .heex templates`);
 const parseHeex = require('./parse-heex');
 
 function findHeexFiles(dir, fileList = []) {
-  const files = fs.readdirSync(dir);
+  try {
+    const files = fs.readdirSync(dir);
 
-  for (const file of files) {
-    const filePath = path.join(dir, file);
-    const stat = fs.statSync(filePath);
+    for (const file of files) {
+      const filePath = path.join(dir, file);
 
-    if (stat.isDirectory()) {
-      // Skip deps, build, and node_modules directories
-      if (!['deps', '_build', 'node_modules', '.git'].includes(file)) {
-        findHeexFiles(filePath, fileList);
+      try {
+        const stat = fs.lstatSync(filePath); // Use lstat to not follow symlinks
+
+        if (stat.isSymbolicLink()) {
+          continue; // Skip symlinks
+        }
+
+        if (stat.isDirectory()) {
+          // Skip deps, build, and node_modules directories
+          if (!['deps', '_build', 'node_modules', '.git', '.elixir_ls', 'cover', 'doc'].includes(file)) {
+            findHeexFiles(filePath, fileList);
+          }
+        } else if (file.endsWith('.heex')) {
+          const relativePath = path.relative(projectRoot, filePath);
+          fileList.push(relativePath);
+        }
+      } catch (err) {
+        // Skip files/dirs that can't be accessed
+        console.error(`Warning: Could not access ${filePath}: ${err.message}`);
+        continue;
       }
-    } else if (file.endsWith('.heex')) {
-      const relativePath = path.relative(projectRoot, filePath);
-      fileList.push(relativePath);
     }
+  } catch (err) {
+    console.error(`Warning: Could not read directory ${dir}: ${err.message}`);
   }
 
   return fileList;
