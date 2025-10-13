@@ -3,8 +3,28 @@
 const { spawn } = require('child_process');
 const Database = require('better-sqlite3');
 const readline = require('readline');
+const { ripgrepSearch } = require('./ripgrep-search');
 
-const dbFile = '../.elixir_context/ec.sqlite';
+// Resolve DB path from CLI or env, fallback to repo-local default
+function resolveDbPath() {
+  const args = process.argv.slice(2);
+  const dbFlagIndex = args.indexOf('--db');
+  if (dbFlagIndex !== -1 && args[dbFlagIndex + 1]) return args[dbFlagIndex + 1];
+  if (process.env.ELIXIR_CONTEXT_DB) return process.env.ELIXIR_CONTEXT_DB;
+  return require('path').resolve(__dirname, '..', '../.elixir_context/ec.sqlite');
+}
+
+// Resolve project root path from CLI or env
+function resolveProjectRoot() {
+  const args = process.argv.slice(2);
+  const rootFlagIndex = args.indexOf('--root');
+  if (rootFlagIndex !== -1 && args[rootFlagIndex + 1]) return args[rootFlagIndex + 1];
+  if (process.env.PROJECT_ROOT) return process.env.PROJECT_ROOT;
+  return require('path').resolve(__dirname, '..', '..');
+}
+
+let dbFile = resolveDbPath();
+let projectRoot = resolveProjectRoot();
 let db;
 
 function initDB() {
@@ -42,12 +62,13 @@ function handleToolsList(id) {
       tools: [
         {
           name: "elixir_context.search",
-          description: "Search for Elixir functions using full-text search",
+          description: "Search for Elixir functions using hybrid FTS + ripgrep search. FTS is tried first for speed, ripgrep fallback provides full-text coverage.",
           inputSchema: {
             type: "object",
             properties: {
-              query: { type: "string" },
-              k: { type: "number", default: 10 },
+              query: { type: "string", description: "Search query (supports FTS syntax and plain text)" },
+              k: { type: "number", default: 10, description: "Max results to return" },
+              use_ripgrep: { type: "boolean", default: true, description: "Enable ripgrep fallback if FTS returns < 3 results" },
               anchor: {
                 type: "object",
                 properties: {
@@ -101,12 +122,12 @@ function handleToolsList(id) {
   });
 }
 
-function handleToolsCall(id, method, params) {
+async function handleToolsCall(id, method, params) {
   try {
     let result;
     switch (method) {
       case "elixir_context.search":
-        result = handleSearch(params);
+        result = await handleSearch(params);
         break;
       case "elixir_context.pack_context":
         result = handlePackContext(params);
@@ -137,9 +158,13 @@ function handleToolsCall(id, method, params) {
   }
 }
 
-function handleSearch(params) {
+async function handleSearch(params) {
   const query = params.query;
   const k = params.k || 10;
+  const useRipgrep = params.use_ripgrep !== false; // Default true
+  const minFtsResults = 3; // Threshold for triggering ripgrep fallback
+
+  // Try FTS first (fast path)
   const ftsQuery = db.prepare(`
     SELECT f.id, f.module, f.name, f.arity, f.path, f.start_line, f.end_line,
            bm25(functions_fts) as score
@@ -149,7 +174,66 @@ function handleSearch(params) {
     ORDER BY score
     LIMIT ?
   `);
-  return ftsQuery.all(query, k);
+  const ftsResults = ftsQuery.all(query, k);
+
+  // If we got enough FTS results or ripgrep is disabled, return them
+  if (ftsResults.length >= minFtsResults || !useRipgrep) {
+    return ftsResults.map(r => ({ ...r, source: 'fts' }));
+  }
+
+  // Otherwise, try ripgrep fallback for better coverage
+  try {
+    const rgResults = await ripgrepSearch(query, projectRoot, k);
+
+    // Convert ripgrep results to same format as FTS
+    const rgFormatted = rgResults.map(rg => ({
+      id: null,
+      module: extractModuleFromPath(rg.path),
+      name: extractFunctionFromLine(rg.line_text),
+      arity: null,
+      path: rg.path,
+      start_line: rg.line_number,
+      end_line: rg.line_number,
+      score: rg.score,
+      source: 'ripgrep',
+      context: rg.line_text
+    }));
+
+    // Merge FTS and ripgrep results, dedupe by path+line
+    const merged = [...ftsResults.map(r => ({ ...r, source: 'fts' })), ...rgFormatted];
+    const deduped = dedupeResults(merged);
+
+    return deduped.slice(0, k);
+  } catch (err) {
+    // If ripgrep fails, just return FTS results
+    console.error('Ripgrep fallback failed:', err.message);
+    return ftsResults.map(r => ({ ...r, source: 'fts' }));
+  }
+}
+
+function extractModuleFromPath(filePath) {
+  // Extract module name from file path like lib/mobus_web/live/company_live/index.ex -> MobusWeb.CompanyLive.Index
+  const match = filePath.match(/lib\/([^\/]+)\/(.+)\.ex$/);
+  if (!match) return 'Unknown';
+
+  const parts = [match[1], ...match[2].split('/')];
+  return parts.map(p => p.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('')).join('.');
+}
+
+function extractFunctionFromLine(line) {
+  // Try to extract function name from line like "  def mount(params, session, socket) do"
+  const match = line.match(/def[p]?\s+([a-z_][a-z0-9_]*)/);
+  return match ? match[1] : null;
+}
+
+function dedupeResults(results) {
+  const seen = new Set();
+  return results.filter(r => {
+    const key = `${r.path}:${r.start_line}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function handlePackContext(params) {

@@ -28,7 +28,15 @@ if (!query) {
   process.exit(1);
 }
 
-const dbFile = '../.elixir_context/ec.sqlite';
+function resolveDb() {
+  const args = process.argv.slice(2);
+  const idx = args.indexOf('--db');
+  if (idx !== -1 && args[idx + 1]) return args[idx + 1];
+  if (process.env.ELIXIR_CONTEXT_DB) return process.env.ELIXIR_CONTEXT_DB;
+  return '../.elixir_context/ec.sqlite';
+}
+
+const dbFile = resolveDb();
 const db = new Database(dbFile);
 
 // FTS query
