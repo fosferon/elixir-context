@@ -3,11 +3,12 @@
   "private": true,
   "bin": { "elixir-context": "bin/elixir-context.js" },
   "scripts": {
-    "ec:export": "bash -lc 'cd ../orchestrator && mix run priv/export.exs > ../.elixir_context/export.jsonl'",
-    "ec:ingest": "node scripts/ingest.js ../.elixir_context/export.jsonl ../.elixir_context/ec.sqlite",
+"ec:export": "bash -lc 'cd ${PROJECT_ROOT:-${npm_config_project:-$PWD}} && mix run ${EXPORTER:-${npm_config_exporter:-$(node -e \"console.log(require(\'path\').resolve(\'scripts/export.exs\'))\")}} --quiet --out ${DATA_DIR:-${npm_config_data:-$PWD/.elixir_context}}/export.jsonl'",
+    "ec:ingest": "node scripts/ingest.js ${DATA_DIR:-${npm_config_data:-$PWD/.elixir_context}}/export.jsonl ${DATA_DIR:-${npm_config_data:-$PWD/.elixir_context}}/ec.sqlite",
     "ec:build": "npm run ec:export && npm run ec:ingest",
-    "ec:serve": "node scripts/mcp-stdio.js --db ../.elixir_context/ec.sqlite",
-    "ec:watch": "node scripts/watch.js --root .. --db ../.elixir_context/ec.sqlite --exporter ../orchestrator/priv/export.exs"
+    "ec:serve": "node scripts/mcp-stdio.js --db ${DATA_DIR:-${npm_config_data:-$PWD/.elixir_context}}/ec.sqlite",
+"ec:watch": "node scripts/watch.js --root ${PROJECT_ROOT:-${npm_config_project:-$PWD}} --db ${DATA_DIR:-${npm_config_data:-$PWD/.elixir_context}}/ec.sqlite --exporter ${EXPORTER:-${npm_config_exporter:-$(node -e \"console.log(require(\'path\').resolve(\'scripts/export.exs\'))\")}}"
+  
   },
   "dependencies": {
     "better-sqlite3": "^9.4.3",

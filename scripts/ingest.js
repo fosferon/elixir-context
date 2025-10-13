@@ -113,3 +113,4 @@ transaction();
 console.log(`Ingested ${lines.length} functions`);
 
 db.close();
+}

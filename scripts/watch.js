@@ -4,12 +4,20 @@ const chokidar = require('chokidar');
 const { spawn } = require('child_process');
 const path = require('path');
 
-const root = path.resolve('../orchestrator');
-const dbFile = path.resolve('../.elixir_context/ec.sqlite');
+// Args: --root <project_root> --db <db_file> --exporter <exporter_exs>
+function getArg(flag, fallback) {
+  const i = process.argv.indexOf(flag);
+  if (i !== -1 && process.argv[i + 1]) return process.argv[i + 1];
+  return fallback;
+}
+
+const root = getArg('--root', process.env.PROJECT_ROOT || path.resolve('..'));
+const dbFile = getArg('--db', process.env.ELIXIR_CONTEXT_DB || path.resolve('../.elixir_context/ec.sqlite'));
+const exporter = getArg('--exporter', process.env.EXPORTER || path.resolve(__dirname, 'export.exs'));
 
 console.log(`Watching ${root} for changes...`);
 
-const watcher = chokidar.watch(['**/*.ex', '**/*.exs', '**/*.heex'], {
+const watcher = chokidar.watch(['**/*.ex', '**/*.exs'], {
   cwd: root,
   ignoreInitial: true,
   awaitWriteFinish: { stabilityThreshold: 1000, pollInterval: 100 }
@@ -22,7 +30,7 @@ function updateIndex(filePath) {
   clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
     // Run export for single file
-    const exportProcess = spawn('mix', ['run', 'priv/export.exs', '--file', filePath], {
+    const exportProcess = spawn('mix', ['run', exporter, '--file', filePath, '--quiet'], {
       cwd: root,
       stdio: ['pipe', 'pipe', 'inherit']
     });

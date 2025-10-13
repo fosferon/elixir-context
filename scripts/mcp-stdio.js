@@ -4,7 +4,16 @@ const { spawn } = require('child_process');
 const Database = require('better-sqlite3');
 const readline = require('readline');
 
-const dbFile = '../.elixir_context/ec.sqlite';
+// Resolve DB path from CLI or env, fallback to repo-local default
+function resolveDbPath() {
+  const args = process.argv.slice(2);
+  const dbFlagIndex = args.indexOf('--db');
+  if (dbFlagIndex !== -1 && args[dbFlagIndex + 1]) return args[dbFlagIndex + 1];
+  if (process.env.ELIXIR_CONTEXT_DB) return process.env.ELIXIR_CONTEXT_DB;
+  return require('path').resolve(__dirname, '..', '../.elixir_context/ec.sqlite');
+}
+
+let dbFile = resolveDbPath();
 let db;
 
 function initDB() {
