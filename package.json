@@ -9,11 +9,16 @@
     "ec:ingest": "node scripts/ingest.js ${DATA_DIR:-${npm_config_data:-$PWD/.elixir_context}}/export.jsonl ${DATA_DIR:-${npm_config_data:-$PWD/.elixir_context}}/ec.sqlite",
     "ec:build": "npm run ec:export && npm run ec:ingest",
     "ec:serve": "node scripts/mcp-stdio.js --db ${DATA_DIR:-${npm_config_data:-$PWD/.elixir_context}}/ec.sqlite",
-    "ec:watch": "node scripts/watch.js --root ${PROJECT_ROOT:-${npm_config_project:-$PWD}} --db ${DATA_DIR:-${npm_config_data:-$PWD/.elixir_context}}/ec.sqlite --exporter ${EXPORTER:-scripts/export.exs}"
+    "ec:watch": "node scripts/watch.js --root ${PROJECT_ROOT:-${npm_config_project:-$PWD}} --db ${DATA_DIR:-${npm_config_data:-$PWD/.elixir_context}}/ec.sqlite --exporter ${EXPORTER:-scripts/export.exs}",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.3",
-    "chokidar": "^3.6.0",
-    "@vscode/ripgrep": "^1.15.9"
+    "@vscode/ripgrep": "^1.15.9",
+    "better-sqlite3": "^12.6.2",
+    "chokidar": "^3.6.0"
+  },
+  "devDependencies": {
+    "vitest": "^1.6.0"
   }
 }

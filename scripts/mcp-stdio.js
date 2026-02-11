@@ -1,38 +1,38 @@
 #!/usr/bin/env node
 
 const { spawn } = require('child_process');
+const fs = require('fs');
 const Database = require('better-sqlite3');
 const readline = require('readline');
 const { ripgrepSearch } = require('./ripgrep-search');
-
-// Resolve DB path from CLI or env, fallback to repo-local default
-function resolveDbPath() {
-  const args = process.argv.slice(2);
-  const dbFlagIndex = args.indexOf('--db');
-  if (dbFlagIndex !== -1 && args[dbFlagIndex + 1]) return args[dbFlagIndex + 1];
-  if (process.env.ELIXIR_CONTEXT_DB) return process.env.ELIXIR_CONTEXT_DB;
-  return require('path').resolve(__dirname, '..', '../.elixir_context/ec.sqlite');
-}
-
-// Resolve project root path from CLI or env
-function resolveProjectRoot() {
-  const args = process.argv.slice(2);
-  const rootFlagIndex = args.indexOf('--root');
-  if (rootFlagIndex !== -1 && args[rootFlagIndex + 1]) return args[rootFlagIndex + 1];
-  if (process.env.PROJECT_ROOT) return process.env.PROJECT_ROOT;
-  return require('path').resolve(__dirname, '..', '..');
-}
+const { logger } = require('./logger');
+const {
+  resolveDbPath,
+  resolveProjectRoot,
+  extractModuleFromPath,
+  extractFunctionFromLine,
+  dedupeResults
+} = require('./utils');
 
 let dbFile = resolveDbPath();
 let projectRoot = resolveProjectRoot();
 let db;
 
 function initDB() {
-  db = new Database(dbFile);
+  try {
+    if (!fs.existsSync(dbFile)) {
+      logger.warn('Database file does not exist; some tools may not work until index is built', { dbFile });
+    }
+    db = new Database(dbFile);
+  } catch (err) {
+    logger.error('Failed to open database', { dbFile, err: err.message });
+    db = null;
+  }
 }
 
 function sendMessage(message) {
-  console.log(JSON.stringify(message));
+  // IMPORTANT: Always write MCP protocol messages to stdout only
+  process.stdout.write(JSON.stringify(message) + '\n');
 }
 
 function handleInitialize(id) {
@@ -116,58 +116,69 @@ function handleToolsList(id) {
             type: "object",
             properties: {}
           }
+        },
+        {
+          name: "elixir_context.health",
+          description: "Health/status of the MCP server and index",
+          inputSchema: { type: "object", properties: {} }
         }
       ]
     }
   });
 }
 
-async function handleToolsCall(id, method, params) {
+async function handleToolsCall(id, toolName, args) {
   try {
     let result;
-    switch (method) {
+    switch (toolName) {
       case "elixir_context.search":
-        result = await handleSearch(params);
+        result = await handleSearch(args);
         break;
       case "elixir_context.pack_context":
-        result = handlePackContext(params);
+        result = handlePackContext(args);
         break;
       case "elixir_context.refresh":
-        result = handleRefresh(params);
+        result = handleRefresh(args);
         break;
       case "elixir_context.index_status":
         result = handleIndexStatus();
         break;
+      case "elixir_context.health":
+        result = handleHealth();
+        break;
       default:
-        throw new Error(`Unknown tool: ${method}`);
+        throw new Error(`Unknown tool: ${toolName}`);
     }
     sendMessage({
       jsonrpc: "2.0",
       id: id,
-      result: result
+      result: {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+      }
     });
   } catch (error) {
+    logger.error('tools/call failed', { toolName, err: error.message });
     sendMessage({
       jsonrpc: "2.0",
       id: id,
-      error: {
-        code: -32000,
-        message: error.message
+      result: {
+        content: [{ type: "text", text: JSON.stringify({ error: error.message }) }],
+        isError: true
       }
     });
   }
 }
 
 async function handleSearch(params) {
+  if (!db) throw new Error('Database not initialized');
   const query = params.query;
   const k = params.k || 10;
   const useRipgrep = params.use_ripgrep !== false; // Default true
-  const minFtsResults = 3; // Threshold for triggering ripgrep fallback
+  const minFtsResults = 2; // Low threshold — ripgrep catches fresh code not yet indexed
 
-  // Try FTS first (fast path)
   const ftsQuery = db.prepare(`
-    SELECT f.id, f.module, f.name, f.arity, f.path, f.start_line, f.end_line,
-           bm25(functions_fts) as score
+    SELECT f.id, f.module, f.name, f.arity, f.kind, f.path, f.start_line, f.end_line,
+           f.signature, bm25(functions_fts) as score
     FROM functions_fts
     JOIN functions f ON functions_fts.id = f.id
     WHERE functions_fts MATCH ?
@@ -176,16 +187,13 @@ async function handleSearch(params) {
   `);
   const ftsResults = ftsQuery.all(query, k);
 
-  // If we got enough FTS results or ripgrep is disabled, return them
   if (ftsResults.length >= minFtsResults || !useRipgrep) {
     return ftsResults.map(r => ({ ...r, source: 'fts' }));
   }
 
-  // Otherwise, try ripgrep fallback for better coverage
   try {
     const rgResults = await ripgrepSearch(query, projectRoot, k);
 
-    // Convert ripgrep results to same format as FTS
     const rgFormatted = rgResults.map(rg => ({
       id: null,
       module: extractModuleFromPath(rg.path),
@@ -199,44 +207,19 @@ async function handleSearch(params) {
       context: rg.line_text
     }));
 
-    // Merge FTS and ripgrep results, dedupe by path+line
     const merged = [...ftsResults.map(r => ({ ...r, source: 'fts' })), ...rgFormatted];
     const deduped = dedupeResults(merged);
 
     return deduped.slice(0, k);
   } catch (err) {
-    // If ripgrep fails, just return FTS results
-    console.error('Ripgrep fallback failed:', err.message);
+    logger.warn('Ripgrep fallback failed', { err: err.message });
     return ftsResults.map(r => ({ ...r, source: 'fts' }));
   }
 }
 
-function extractModuleFromPath(filePath) {
-  // Extract module name from file path like lib/mobus_web/live/company_live/index.ex -> MobusWeb.CompanyLive.Index
-  const match = filePath.match(/lib\/([^\/]+)\/(.+)\.ex$/);
-  if (!match) return 'Unknown';
-
-  const parts = [match[1], ...match[2].split('/')];
-  return parts.map(p => p.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('')).join('.');
-}
-
-function extractFunctionFromLine(line) {
-  // Try to extract function name from line like "  def mount(params, session, socket) do"
-  const match = line.match(/def[p]?\s+([a-z_][a-z0-9_]*)/);
-  return match ? match[1] : null;
-}
-
-function dedupeResults(results) {
-  const seen = new Set();
-  return results.filter(r => {
-    const key = `${r.path}:${r.start_line}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
 
 function handlePackContext(params) {
+  if (!db) throw new Error('Database not initialized');
   let results;
   if (params.ids) {
     const placeholders = params.ids.map(() => '?').join(',');
@@ -269,26 +252,123 @@ function handlePackContext(params) {
 }
 
 function handleRefresh(params) {
-  // Run export and ingest
-  const exportProcess = spawn('bash', ['-lc', 'cd ../orchestrator && mix run priv/export.exs > ../.elixir_context/export.jsonl'], { stdio: 'inherit' });
-  exportProcess.on('exit', (code) => {
-    if (code === 0) {
-      const ingestProcess = spawn('node', ['scripts/ingest.js', '../.elixir_context/export.jsonl', '../.elixir_context/ec.sqlite'], { stdio: 'inherit' });
-      ingestProcess.on('exit', (ingestCode) => {
-        // For simplicity, assume success
+  const paths = params.paths || [];
+  const isIncremental = paths.length > 0;
+  const exporterPath = require('path').resolve(__dirname, 'export.exs');
+  const ingestPath = require('path').resolve(__dirname, 'ingest.js');
+
+  if (isIncremental) {
+    // Incremental: export only specified files, ingest with --incremental
+    logger.info('Starting incremental refresh', { files: paths.length });
+    const exportArgs = ['run', '--no-compile', '--no-start', exporterPath, '--files', '--quiet', ...paths];
+    const exportProcess = spawn('mix', exportArgs, {
+      cwd: projectRoot,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    let jsonl = '';
+    exportProcess.stdout.on('data', (d) => { jsonl += d.toString(); });
+    exportProcess.stderr.on('data', (d) => { logger.warn('export stderr', { data: d.toString().slice(0, 200) }); });
+
+    exportProcess.on('exit', (code) => {
+      if (code !== 0) {
+        logger.error('Incremental export failed', { code });
+        return;
+      }
+      if (!jsonl.trim()) {
+        logger.info('Incremental export returned no entries');
+        return;
+      }
+      const ingestProcess = spawn('node', [ingestPath, '-', dbFile, '--incremental'], {
+        stdio: ['pipe', 'pipe', 'pipe']
       });
-    }
-  });
-  return { updated: 1 }; // Placeholder
+      ingestProcess.stdin.write(jsonl);
+      ingestProcess.stdin.end();
+      ingestProcess.stdout.on('data', (d) => { logger.info('ingest', { msg: d.toString().trim() }); });
+      ingestProcess.stderr.on('data', (d) => { logger.warn('ingest stderr', { data: d.toString().slice(0, 200) }); });
+      ingestProcess.on('exit', (ingestCode) => {
+        if (ingestCode !== 0) {
+          logger.error('Incremental ingest failed', { ingestCode });
+        } else {
+          logger.info('Incremental refresh completed');
+          // Reopen DB to pick up changes
+          try { if (db) db.close(); } catch(e) {}
+          initDB();
+        }
+      });
+    });
+  } else {
+    // Full rebuild: export everything, full ingest (drops and recreates tables)
+    logger.info('Starting full refresh');
+    const exportProcess = spawn('mix', ['run', '--no-compile', '--no-start', exporterPath, '--quiet'], {
+      cwd: projectRoot,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+
+    let jsonl = '';
+    exportProcess.stdout.on('data', (d) => { jsonl += d.toString(); });
+    exportProcess.stderr.on('data', (d) => { logger.warn('export stderr', { data: d.toString().slice(0, 200) }); });
+
+    exportProcess.on('exit', (code) => {
+      if (code !== 0) {
+        logger.error('Full export failed', { code });
+        return;
+      }
+      const ingestProcess = spawn('node', [ingestPath, '-', dbFile], {
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      ingestProcess.stdin.write(jsonl);
+      ingestProcess.stdin.end();
+      ingestProcess.stdout.on('data', (d) => { logger.info('ingest', { msg: d.toString().trim() }); });
+      ingestProcess.stderr.on('data', (d) => { logger.warn('ingest stderr', { data: d.toString().slice(0, 200) }); });
+      ingestProcess.on('exit', (ingestCode) => {
+        if (ingestCode !== 0) {
+          logger.error('Full ingest failed', { ingestCode });
+        } else {
+          logger.info('Full refresh completed');
+          try { if (db) db.close(); } catch(e) {}
+          initDB();
+        }
+      });
+    });
+  }
+
+  return { started: true, mode: isIncremental ? 'incremental' : 'full', files: paths.length };
 }
 
 function handleIndexStatus() {
-  const functionsCount = db.prepare('SELECT count(*) as count FROM functions').get().count;
-  const edgesCount = db.prepare('SELECT count(*) as count FROM edges').get().count;
+  if (!db) {
+    return { functions: 0, edges: 0, updated_at: null, db_connected: false, db_path: dbFile };
+  }
+  try {
+    const functionsCount = db.prepare('SELECT count(*) as count FROM functions').get().count;
+    const edgesCount = db.prepare('SELECT count(*) as count FROM edges').get().count;
+    return {
+      functions: functionsCount,
+      edges: edgesCount,
+      updated_at: new Date().toISOString(),
+      db_connected: true,
+      db_path: dbFile
+    };
+  } catch (err) {
+    // Tables missing or DB not yet initialized
+    return {
+      functions: 0,
+      edges: 0,
+      updated_at: null,
+      db_connected: true,
+      db_path: dbFile,
+      warning: 'index schema missing'
+    };
+  }
+}
+
+function handleHealth() {
+  const status = handleIndexStatus();
   return {
-    functions: functionsCount,
-    edges: edgesCount,
-    updated_at: new Date().toISOString()
+    ok: !!status.db_connected,
+    project_root: projectRoot,
+    ...status
   };
 }
 
@@ -301,16 +381,51 @@ const rl = readline.createInterface({
 initDB();
 
 rl.on('line', (line) => {
+  let message;
   try {
-    const message = JSON.parse(line.trim());
+    message = JSON.parse((line || '').trim());
+  } catch (error) {
+    // Log but do not write to stdout to avoid protocol corruption
+    logger.warn('Received invalid JSON on stdin', { err: error.message });
+    return;
+  }
+
+  try {
+    // Notifications (no id) — acknowledge silently
+    if (!message.id && message.method && message.method.startsWith('notifications/')) {
+      return;
+    }
+
     if (message.method === "initialize") {
       handleInitialize(message.id);
     } else if (message.method === "tools/list") {
       handleToolsList(message.id);
     } else if (message.method === "tools/call") {
-      handleToolsCall(message.id, message.params.method, message.params.params);
+      // MCP spec: params.name + params.arguments (not params.method + params.params)
+      const toolName = message.params.name || message.params.method;
+      const args = message.params.arguments || message.params.params || {};
+      handleToolsCall(message.id, toolName, args);
+    } else if (message.id) {
+      // Unknown method with an id — respond with method not found
+      sendMessage({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } });
     }
-  } catch (error) {
-    // Ignore invalid JSON
+  } catch (err) {
+    logger.error('Failed to handle message', { err: err.message });
+    if (message.id) {
+      sendMessage({ jsonrpc: "2.0", id: message.id, error: { code: -32603, message: err.message } });
+    }
   }
 });
+
+function safeClose() {
+  try {
+    if (db) db.close();
+  } catch (err) {
+    // ignore
+  }
+}
+
+process.on('SIGINT', () => { logger.info('SIGINT received, shutting down'); safeClose(); process.exit(0); });
+process.on('SIGTERM', () => { logger.info('SIGTERM received, shutting down'); safeClose(); process.exit(0); });
+process.on('uncaughtException', (err) => { logger.error('uncaughtException', { err: err.message }); safeClose(); process.exit(1); });
+process.on('unhandledRejection', (reason) => { logger.error('unhandledRejection', { err: String(reason) }); });
