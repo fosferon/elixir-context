@@ -61,8 +61,8 @@ function handleToolsList(id) {
     result: {
       tools: [
         {
-          name: "elixir_context.search",
-          description: "Search for Elixir functions using hybrid FTS + ripgrep search. FTS is tried first for speed, ripgrep fallback provides full-text coverage.",
+          name: "elixir_context_search",
+          description: "Find Elixir functions by name, module, doc, or keywords. Returns module, function name, arity, kind, path, line, signature, and score. Use this as your first lookup — then use callers_of/calls_from to trace call chains, or pack_context to get full definitions. Query is auto-sanitized: dots, slashes, parens are fine (e.g. 'WorkflowEngine.advance_execution').",
           inputSchema: {
             type: "object",
             properties: {
@@ -81,8 +81,8 @@ function handleToolsList(id) {
           }
         },
         {
-          name: "elixir_context.pack_context",
-          description: "Pack context for Elixir functions",
+          name: "elixir_context_pack_context",
+          description: "Get full function definitions with doc, spec, and source code for a set of functions. Pass query: (same as search) or ids: (array of sha256 IDs from prior search results). Returns the actual code definitions ready to read — use this when you need to understand WHAT a function does, not just that it exists.",
           inputSchema: {
             type: "object",
             properties: {
@@ -100,7 +100,33 @@ function handleToolsList(id) {
           }
         },
         {
-          name: "elixir_context.refresh",
+          name: "elixir_context_callers_of",
+          description: "Find all functions that call a given Module.function/arity. Queries the call-edge index for reverse lookups (who references this symbol). Target forms accepted: bare 'Module.function' (matches ALL arities), 'Module.function/2' (exact arity), or any wildcard form like 'WorkflowEngine.%', '%.advance_execution%', 'Repo.insert/%'. Bare form is auto-expanded to match every arity.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              target: { type: "string", description: "Target function in Module.function/arity format. Use % as wildcard. Examples: 'WorkflowEngine.advance_execution/2', 'Repo.insert/%', '%.delete_workflow%'" },
+              k: { type: "number", default: 30, description: "Max results" }
+            },
+            required: ["target"]
+          }
+        },
+        {
+          name: "elixir_context_calls_from",
+          description: "Find all functions called BY a given function. Queries the call-edge index for forward lookups (what does this symbol invoke). Accepts: id (sha256), module+name as separate fields, or target as 'Module.function' dotted string.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Function ID from a prior search result" },
+              target: { type: "string", description: "Dotted function reference: 'Module.function' or 'Module.function/arity'" },
+              module: { type: "string", description: "Module name (alternative to target)" },
+              name: { type: "string", description: "Function name (alternative to target)" },
+              k: { type: "number", default: 50, description: "Max results" }
+            }
+          }
+        },
+        {
+          name: "elixir_context_refresh",
           description: "Refresh the index",
           inputSchema: {
             type: "object",
@@ -110,7 +136,7 @@ function handleToolsList(id) {
           }
         },
         {
-          name: "elixir_context.index_status",
+          name: "elixir_context_index_status",
           description: "Get index status",
           inputSchema: {
             type: "object",
@@ -118,7 +144,7 @@ function handleToolsList(id) {
           }
         },
         {
-          name: "elixir_context.health",
+          name: "elixir_context_health",
           description: "Health/status of the MCP server and index",
           inputSchema: { type: "object", properties: {} }
         }
@@ -131,19 +157,25 @@ async function handleToolsCall(id, toolName, args) {
   try {
     let result;
     switch (toolName) {
-      case "elixir_context.search":
+      case "elixir_context_search":
         result = await handleSearch(args);
         break;
-      case "elixir_context.pack_context":
+      case "elixir_context_pack_context":
         result = handlePackContext(args);
         break;
-      case "elixir_context.refresh":
+      case "elixir_context_callers_of":
+        result = handleCallersOf(args);
+        break;
+      case "elixir_context_calls_from":
+        result = handleCallsFrom(args);
+        break;
+      case "elixir_context_refresh":
         result = handleRefresh(args);
         break;
-      case "elixir_context.index_status":
+      case "elixir_context_index_status":
         result = handleIndexStatus();
         break;
-      case "elixir_context.health":
+      case "elixir_context_health":
         result = handleHealth();
         break;
       default:
@@ -169,12 +201,33 @@ async function handleToolsCall(id, toolName, args) {
   }
 }
 
+// Resolve the query string from tool arguments, checking canonical field and common aliases.
+function resolveQuery(params) {
+  return params.query || params.q || null;
+}
+
+// Sanitize a query string for FTS5 MATCH — strips special chars that cause syntax errors
+// (dots, parens, slashes, colons, quotes, etc.) and returns space-separated tokens.
+// Returns '' for non-string / empty input (never throws).
+function sanitizeFtsQuery(raw) {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .replace(/[.(){}\[\]\/:"'@#!$%^&*+=|;<>?\\,]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 async function handleSearch(params) {
   if (!db) throw new Error('Database not initialized');
-  const query = params.query;
+  const query = resolveQuery(params);
+  if (!query || typeof query !== 'string') {
+    return { error: 'missing_query', message: 'A non-empty string "query" parameter is required.' };
+  }
   const k = params.k || 10;
   const useRipgrep = params.use_ripgrep !== false; // Default true
   const minFtsResults = 2; // Low threshold — ripgrep catches fresh code not yet indexed
+
+  const ftsSafeQuery = sanitizeFtsQuery(query);
 
   const ftsQuery = db.prepare(`
     SELECT f.id, f.module, f.name, f.arity, f.kind, f.path, f.start_line, f.end_line,
@@ -185,7 +238,14 @@ async function handleSearch(params) {
     ORDER BY score
     LIMIT ?
   `);
-  const ftsResults = ftsQuery.all(query, k);
+  let ftsResults;
+  try {
+    ftsResults = ftsSafeQuery ? ftsQuery.all(ftsSafeQuery, k) : [];
+  } catch (e) {
+    // FTS5 can still choke on edge cases — fall through to ripgrep
+    logger.warn('FTS5 query failed, falling back to ripgrep', { query: ftsSafeQuery, err: e.message });
+    ftsResults = [];
+  }
 
   if (ftsResults.length >= minFtsResults || !useRipgrep) {
     return ftsResults.map(r => ({ ...r, source: 'fts' }));
@@ -221,11 +281,12 @@ async function handleSearch(params) {
 function handlePackContext(params) {
   if (!db) throw new Error('Database not initialized');
   let results;
-  if (params.ids) {
+  if (params.ids && params.ids.length > 0) {
     const placeholders = params.ids.map(() => '?').join(',');
     const query = db.prepare(`SELECT * FROM functions WHERE id IN (${placeholders})`);
     results = query.all(params.ids);
   } else if (params.query) {
+    const ftsSafeQuery = sanitizeFtsQuery(params.query);
     const ftsQuery = db.prepare(`
       SELECT f.* FROM functions_fts
       JOIN functions f ON functions_fts.id = f.id
@@ -233,7 +294,7 @@ function handlePackContext(params) {
       ORDER BY bm25(functions_fts)
       LIMIT ?
     `);
-    results = ftsQuery.all(params.query, params.k || 10);
+    results = ftsSafeQuery ? ftsQuery.all(ftsSafeQuery, params.k || 10) : [];
   } else {
     results = [];
   }
@@ -249,6 +310,112 @@ function handlePackContext(params) {
     sources.push({ path: row.path, start_line: row.start_line, end_line: row.end_line || row.start_line });
   }
   return { text, sources };
+}
+
+// Normalize a callers_of target so a bare "Module.function" matches all arities.
+// Stored dst_mfa is ALWAYS "Module.function/arity", so a bare target with no "/"
+// would silently match nothing (the "dead code confirmed" trap). If the caller
+// already supplied an arity or any wildcard, leave the target intact.
+function normalizeCallersTarget(raw) {
+  if (typeof raw !== 'string') return raw;
+  const t = raw.trim();
+  if (t === '') return t;
+  if (t.includes('/')) return t;   // explicit arity ("/2") or wildcard arity ("/%")
+  return t + '/%';                 // bare Module.function -> all arities
+}
+
+function handleCallersOf(params) {
+  if (!db) throw new Error('Database not initialized');
+  const rawTarget = params.target;
+  if (!rawTarget || typeof rawTarget !== 'string') {
+    return { error: 'missing_target', message: 'A non-empty string "target" parameter is required.' };
+  }
+  const target = normalizeCallersTarget(rawTarget);
+  const k = params.k || 30;
+
+  // Query edges where dst_mfa matches (supports SQL LIKE wildcards)
+  const q = db.prepare(`
+    SELECT e.dst_mfa as target, f.id, f.module, f.name, f.arity, f.kind, f.path, f.start_line, f.signature
+    FROM edges e
+    JOIN functions f ON f.id = e.src_id
+    WHERE e.dst_mfa LIKE ?
+    ORDER BY f.module, f.name
+    LIMIT ?
+  `);
+  const rows = q.all(target, k);
+
+  // Group by target for readability
+  const grouped = {};
+  for (const r of rows) {
+    const key = r.target;
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push({
+      module: r.module, name: r.name, arity: r.arity, kind: r.kind,
+      path: r.path, line: r.start_line, signature: r.signature
+    });
+  }
+
+  return {
+    query: rawTarget,
+    resolved_pattern: target,
+    total_matches: rows.length,
+    targets: Object.entries(grouped).map(([target, callers]) => ({ target, callers }))
+  };
+}
+
+function handleCallsFrom(params) {
+  if (!db) throw new Error('Database not initialized');
+  const k = params.k || 50;
+
+  // Resolve function ID from id, module+name, or dotted "Module.function" string
+  let funcId = params.id || null;
+  if (!funcId && params.module && params.name) {
+    const lookup = db.prepare(`
+      SELECT id FROM functions WHERE module = ? AND name = ? LIMIT 1
+    `);
+    const row = lookup.get(params.module, params.name);
+    funcId = row ? row.id : null;
+  }
+  if (!funcId && params.target) {
+    // Parse "Module.function" or "Module.function/arity" dotted string
+    const match = params.target.match(/^(.+)\.([^.\/]+)(?:\/(\d+))?$/);
+    if (match) {
+      const lookup = db.prepare(`
+        SELECT id FROM functions WHERE module = ? AND name = ? ${match[3] ? 'AND arity = ?' : ''} LIMIT 1
+      `);
+      const row = match[3]
+        ? lookup.get(match[1], match[2], parseInt(match[3]))
+        : lookup.get(match[1], match[2]);
+      funcId = row ? row.id : null;
+    }
+  }
+
+  if (!funcId) {
+    return { error: 'Function not found. Provide id, or module+name.', params };
+  }
+
+  // Get the function itself
+  const funcRow = db.prepare('SELECT * FROM functions WHERE id = ?').get(funcId);
+
+  // Get all outgoing edges
+  const q = db.prepare(`
+    SELECT e.dst_mfa as callee
+    FROM edges e
+    WHERE e.src_id = ?
+    ORDER BY e.dst_mfa
+    LIMIT ?
+  `);
+  const callees = q.all(funcId, k).map(r => r.callee);
+
+  return {
+    function: {
+      module: funcRow.module, name: funcRow.name, arity: funcRow.arity,
+      kind: funcRow.kind, path: funcRow.path, line: funcRow.start_line,
+      signature: funcRow.signature
+    },
+    calls: callees,
+    total: callees.length
+  };
 }
 
 function handleRefresh(params) {
