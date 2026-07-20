@@ -121,7 +121,8 @@ defmodule Exporter do
                 start_line: d.start_line,
                 end_line: d.end_line || d.start_line,
                 head_patterns: d.head_patterns,
-                guarded: d.guarded
+                guarded: d.guarded,
+                guard_preds: d.guard_preds
               }
             end)
           Map.put(base, :clauses, clauses)
@@ -138,7 +139,7 @@ defmodule Exporter do
       Enum.reduce(unique_defs, %{}, fn d, acc ->
         key = {d.module, d.name, d.arity}
         Enum.reduce(Map.get(d, :clauses) || [], acc, fn c, acc2 ->
-          entry = {c.ordinal, c.head_patterns, c.guarded}
+          entry = {c.ordinal, c.head_patterns, c.guarded, c.guard_preds}
           Map.update(acc2, key, [entry], fn existing -> existing ++ [entry] end)
         end)
       end)
@@ -147,9 +148,13 @@ defmodule Exporter do
       Enum.map(unique_defs, fn d ->
         attributed = Enum.map(d.calls, &attribute_call(&1, clause_index))
         d_clauses = Map.get(d, :clauses)
-        clean_clauses = Enum.map(d_clauses || [], &Map.drop(&1, [:head_patterns, :guarded]))
+        clean_clauses = Enum.map(d_clauses || [], &Map.drop(&1, [:head_patterns, :guarded, :guard_preds]))
         d2 = %{d | calls: attributed}
-        if d_clauses, do: %{d2 | clauses: clean_clauses}, else: d2
+        d3 = if d_clauses, do: %{d2 | clauses: clean_clauses}, else: d2
+        # head_patterns/guarded/guard_preds are attribution-pass scratch state
+        # on the def itself — strip before emit (tuples aren't JSON-encodable
+        # and they're not part of the public schema).
+        Map.drop(d3, [:head_patterns, :guarded, :guard_preds])
       end)
 
     if out_path do
@@ -444,10 +449,16 @@ defmodule Exporter do
     doc = Map.get(attrs, :pending_doc)
 
     # Whether this clause has a `when` guard. Guarded clauses can't be
-    # definitively attributed to a call site (the guard may fail at runtime),
-    # so the attribution pass treats a structural match against a guarded
-    # clause as :unknown rather than :match.
+    # definitively attributed to a call site unless the guard is evaluable
+    # (simple `is_X(var)` predicates). The attribution pass evaluates those
+    # against literal call args; anything more complex degrades to :unknown.
     guarded = match?({_, _, [{:when, _, _} | _]}, node)
+    guard_ast =
+      case node do
+        {_, _, [{:when, _, [_, g]} | _]} -> g
+        _ -> nil
+      end
+    guard_preds = extract_guard_predicates(guard_ast, args_list)
 
     # Normalized head patterns (one per arg) used by the clause-attribution
     # pass to unify against call-site argument patterns. See norm_pat/2.
@@ -482,7 +493,8 @@ defmodule Exporter do
       struct_text: struct_text,
       calls: calls,
       head_patterns: head_patterns,
-      guarded: guarded
+      guarded: guarded,
+      guard_preds: guard_preds
     }
   end
 
@@ -636,6 +648,101 @@ defmodule Exporter do
   defp resolve_server(_, _), do: nil
 
   # ------------------------------------------------------------------
+  # Guard evaluation (Tier 2 refinement)
+  # ------------------------------------------------------------------
+  # Extract simple `is_X(var)` predicates from a `when` guard, mapped to the
+  # head argument index they constrain. Only top-level and-conjunctions of
+  # Kernel type-test guards are parsed; anything more complex (or, comparisons,
+  # custom guards) yields [] and the clause stays conservatively :unknown.
+
+  @type_preds MapSet.new(~w(
+    is_atom is_integer is_float is_number is_binary is_bitstring
+    is_list is_map is_tuple is_boolean is_function is_pid is_port is_reference
+  )a)
+
+  defp extract_guard_predicates(nil, _args), do: []
+
+  defp extract_guard_predicates(guard, args) do
+    name_to_idx =
+      args
+      |> Enum.with_index()
+      |> Enum.flat_map(fn
+        {name, idx} when is_atom(name) -> [{to_string(name), idx}]
+        {var, idx} ->
+          case var do
+            {n, _, ctx} when is_atom(n) and is_atom(ctx) -> [{to_string(n), idx}]
+            _ -> []
+          end
+      end)
+      |> Enum.into(%{})
+
+    collect_is_preds(guard, name_to_idx)
+  end
+
+  defp collect_is_preds({:and, _, [l, r]}, map),
+    do: collect_is_preds(l, map) ++ collect_is_preds(r, map)
+
+  defp collect_is_preds({pred, _, [{name, _, ctx}]}, map)
+       when is_atom(pred) and is_atom(name) and is_atom(ctx) do
+    if MapSet.member?(@type_preds, pred) do
+      case Map.get(map, to_string(name)) do
+        nil -> []
+        idx -> [{pred, idx}]
+      end
+    else
+      []
+    end
+  end
+
+  defp collect_is_preds(_, _), do: []
+
+  # Evaluate a clause's guard predicates against a call-site arg-pattern list.
+  # :sat = guard satisfied; :unsat = guard rules the clause out; :unknown =
+  # can't decide (call arg is a var/other).
+  defp eval_guard(preds, arg_patterns) do
+    Enum.reduce(preds, :sat, fn {pred, idx}, acc ->
+      case acc do
+        :unsat ->
+          :unsat
+
+        _ ->
+          case eval_type_pred(pred, Enum.at(arg_patterns, idx)) do
+            :unsat -> :unsat
+            :unknown -> :unknown
+            :sat -> acc
+          end
+      end
+    end)
+  end
+
+  # Per-predicate evaluation against a normalized call-site pattern.
+  defp eval_type_pred(_, nil), do: :unknown
+  defp eval_type_pred(:is_atom, %{"t" => t}) when t in ~w(atom nil), do: :sat
+  defp eval_type_pred(:is_atom, %{"t" => "lit"}), do: :sat
+  defp eval_type_pred(:is_atom, %{"t" => t}) when t in ~w(var other), do: :unknown
+  defp eval_type_pred(:is_atom, _), do: :unsat
+  defp eval_type_pred(:is_boolean, %{"t" => "lit"}), do: :sat
+  defp eval_type_pred(:is_boolean, %{"t" => "atom"}), do: :unknown
+  defp eval_type_pred(:is_boolean, %{"t" => t}) when t in ~w(var other), do: :unknown
+  defp eval_type_pred(:is_boolean, _), do: :unsat
+  defp eval_type_pred(pred, %{"t" => "num"}) when pred in [:is_integer, :is_float, :is_number], do: :sat
+  defp eval_type_pred(pred, %{"t" => t}) when pred in [:is_integer, :is_float, :is_number] and t in ~w(var other), do: :unknown
+  defp eval_type_pred(pred, _) when pred in [:is_integer, :is_float, :is_number], do: :unsat
+  defp eval_type_pred(:is_binary, %{"t" => "str"}), do: :sat
+  defp eval_type_pred(:is_binary, %{"t" => t}) when t in ~w(var other), do: :unknown
+  defp eval_type_pred(:is_binary, _), do: :unsat
+  defp eval_type_pred(:is_list, %{"t" => "list"}), do: :sat
+  defp eval_type_pred(:is_list, %{"t" => t}) when t in ~w(var other), do: :unknown
+  defp eval_type_pred(:is_list, _), do: :unsat
+  defp eval_type_pred(:is_tuple, %{"t" => "tuple"}), do: :sat
+  defp eval_type_pred(:is_tuple, %{"t" => t}) when t in ~w(var other), do: :unknown
+  defp eval_type_pred(:is_tuple, _), do: :unsat
+  defp eval_type_pred(:is_map, %{"t" => t}) when t in ~w(var other), do: :unknown
+  defp eval_type_pred(:is_map, _), do: :unsat
+  defp eval_type_pred(_, %{"t" => t}) when t in ~w(var other), do: :unknown
+  defp eval_type_pred(_, _), do: :unsat
+
+  # ------------------------------------------------------------------
   # Pattern normalization (term language for clause attribution)
   # ------------------------------------------------------------------
   # Produces a JSON-encodable map. The attribution pass unifies a call-site
@@ -728,16 +835,16 @@ defmodule Exporter do
           clauses ->
             ordered = Enum.sort_by(clauses, &elem(&1, 0))
             results =
-              Enum.map(ordered, fn {ordinal, head_pats, guarded} ->
+              Enum.map(ordered, fn {ordinal, head_pats, has_guard, guard_preds} ->
                 if length(head_pats) != length(arg_patterns) do
                   {ordinal, :nomatch}
                 else
                   case unify_seq(arg_patterns, head_pats) do
                     :nomatch ->
                       {ordinal, :nomatch}
-                    res ->
-                      res = if guarded and res == :match, do: :unknown, else: res
-                      {ordinal, res}
+
+                    struct_res ->
+                      {ordinal, apply_guard(struct_res, has_guard, guard_preds, arg_patterns)}
                   end
                 end
               end)
@@ -764,6 +871,23 @@ defmodule Exporter do
 
       :error ->
         base
+    end
+  end
+
+  # Combine a structural unify result with a guard evaluation into the final
+  # clause-attribution verdict. A clause matches only if BOTH its head and its
+  # guard could succeed; an :unsat guard rules the clause out (:nomatch).
+  defp apply_guard(struct_res, _guarded, _guard_preds, _arg_patterns) when struct_res == :nomatch,
+    do: :nomatch
+  defp apply_guard(struct_res, false, _guard_preds, _arg_patterns),
+    do: struct_res
+  defp apply_guard(struct_res, true, [], _arg_patterns),
+    do: if(struct_res == :match, do: :unknown, else: struct_res)
+  defp apply_guard(struct_res, true, guard_preds, arg_patterns) do
+    case eval_guard(guard_preds, arg_patterns) do
+      :unsat -> :nomatch
+      :sat -> struct_res
+      :unknown -> if(struct_res == :match, do: :unknown, else: struct_res)
     end
   end
 
