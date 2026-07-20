@@ -99,6 +99,17 @@ defmodule GcDaemon do
   def ping_conn, do: GenServer.call(Bee.Repo, :conn)
   def query(sql), do: GenServer.call(Bee.Repo, {:query, sql})
   def vague(msg), do: GenServer.call(Bee.Repo, msg)
+
+  # Guarded clauses — exercised by type-guard evaluation
+  def kind(n) when is_integer(n), do: :int
+  def kind(s) when is_binary(s), do: :str
+  def kind(_), do: :other
+
+  def caller_kind do
+    kind(5)
+    kind("hi")
+    kind(:x)
+  end
 end
 `;
 
@@ -222,6 +233,24 @@ describeIntegration('export -> ingest -> query (all tiers)', () => {
     setup(); try { build(); const db = openDb();
       const noise = db.prepare(`SELECT count(*) as c FROM edges WHERE dst_mfa LIKE '%.handle_call/%' AND attribution IS NULL`).get().c;
       expect(noise).toBe(0);
+    db.close(); } finally { teardown(); }
+  });
+
+  // ---- Tier 2 refinement: type-guard evaluation ----
+
+  it('type-guard: is_X guards are evaluated so guarded clauses attribute correctly', () => {
+    setup(); try { build(); const db = openDb();
+      // kind/3 clauses: (1) when is_integer(n), (2) when is_binary(s), (3) catch-all.
+      const edges = attributedEdges(db, 'caller_kind', 'GcDaemon.kind/1');
+      const byLine = Object.fromEntries(edges.map(e => [e.line, e.clause]));
+      const lines = Object.keys(byLine).map(Number).sort((a, b) => a - b);
+      // kind(5) -> guard is_integer satisfied -> clause 1
+      expect(byLine[lines[0]]).toBe(1);
+      // kind("hi") -> clause 1 guard unsat, clause 2 guard sat -> clause 2
+      expect(byLine[lines[1]]).toBe(2);
+      // kind(:x) -> both guards unsat -> clause 3 catch-all
+      expect(byLine[lines[2]]).toBe(3);
+      expect(edges.every(e => e.attr === 'direct')).toBe(true);
     db.close(); } finally { teardown(); }
   });
 
