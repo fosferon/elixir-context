@@ -93,15 +93,39 @@ defmodule Exporter do
       end
     end)
 
-    # Deduplicate: merge multi-clause functions (union calls, keep earliest line)
+    # Deduplicate: merge multi-clause functions (union calls, keep earliest line,
+    # and ENUMERATE every clause instead of collapsing to the first).
     unique_defs =
       all_defs
       |> Enum.group_by(fn def -> {def.module, def.name, def.arity, def.kind} end)
       |> Enum.map(fn {_key, defs} ->
-        primary = Enum.min_by(defs, & &1.start_line)
+        sorted = Enum.sort_by(defs, & &1.start_line)
+        primary = hd(sorted)
         last = Enum.max_by(defs, & &1.end_line)
         merged_calls = defs |> Enum.flat_map(& &1.calls) |> Enum.uniq()
-        %{primary | calls: merged_calls, end_line: last.end_line}
+
+        # Build a clause manifest (ordinal, signature, line range) for every
+        # clause. Only def-kinds have real clauses; module/use/schema/macro_call
+        # entries are single conceptual units and get no clause list.
+        def_kinds = ~w(function function_private macro macro_private)
+        base = %{primary | calls: merged_calls, end_line: last.end_line}
+
+        if primary.kind in def_kinds do
+          clauses =
+            sorted
+            |> Enum.with_index(1)
+            |> Enum.map(fn {d, ordinal} ->
+              %{
+                ordinal: ordinal,
+                signature: d.signature,
+                start_line: d.start_line,
+                end_line: d.end_line || d.start_line
+              }
+            end)
+          Map.put(base, :clauses, clauses)
+        else
+          base
+        end
       end)
 
     if out_path do
