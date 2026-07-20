@@ -28,13 +28,14 @@ if (!incremental) {
   db.exec('DROP TABLE IF EXISTS functions_fts');
 
   db.exec('CREATE TABLE functions (id TEXT PRIMARY KEY, module TEXT, name TEXT, arity INTEGER, kind TEXT DEFAULT \'function\', path TEXT, start_line INTEGER, end_line INTEGER, signature TEXT, spec TEXT, doc TEXT, lexical_text TEXT, struct_text TEXT)');
-  db.exec('CREATE TABLE edges (src_id TEXT, dst_mfa TEXT, kind TEXT, UNIQUE(src_id, dst_mfa, kind))');
+  db.exec('CREATE TABLE edges (src_id TEXT, dst_mfa TEXT, kind TEXT, dst_clause INTEGER, attribution TEXT, dispatch TEXT, call_line INTEGER)');
   db.exec('CREATE TABLE clauses (id TEXT PRIMARY KEY, function_id TEXT, ordinal INTEGER, start_line INTEGER, end_line INTEGER, signature TEXT)');
   db.exec('CREATE VIRTUAL TABLE functions_fts USING fts5(id, module, lexical_text)');
   db.exec('CREATE INDEX idx_functions_module_name_arity ON functions(module, name, arity)');
   db.exec('CREATE INDEX idx_functions_path ON functions(path)');
   db.exec('CREATE INDEX idx_functions_kind ON functions(kind)');
   db.exec('CREATE INDEX idx_edges_dst ON edges(dst_mfa)');
+  db.exec('CREATE INDEX idx_edges_clause ON edges(dst_mfa, dst_clause)');
   db.exec('CREATE INDEX idx_clauses_function ON clauses(function_id)');
 } else {
   // Incremental: ensure tables exist (no-op if they do)
@@ -47,6 +48,10 @@ if (!incremental) {
   // clauses table was added after edges; create on demand for older DBs.
   db.exec('CREATE TABLE IF NOT EXISTS clauses (id TEXT PRIMARY KEY, function_id TEXT, ordinal INTEGER, start_line INTEGER, end_line INTEGER, signature TEXT)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_clauses_function ON clauses(function_id)');
+  // Tier 2: edges gained dst_clause/attribution/dispatch/call_line. Add any
+  // missing columns so an incremental rebuild against an older DB upgrades
+  // in place without forcing a full nuke.
+  ensureEdgeColumns(db);
 }
 
 // Prepare statements
@@ -56,8 +61,8 @@ const insertFunction = db.prepare(`
 `);
 
 const insertEdge = db.prepare(`
-  INSERT OR IGNORE INTO edges (src_id, dst_mfa, kind)
-  VALUES (?, ?, ?)
+  INSERT INTO edges (src_id, dst_mfa, kind, dst_clause, attribution, dispatch, call_line)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
 `);
 
 const insertClause = db.prepare(`
@@ -75,6 +80,43 @@ const deleteByPath = incremental ? db.prepare('DELETE FROM functions WHERE path 
 const deleteFtsByIds = incremental ? db.prepare('DELETE FROM functions_fts WHERE id IN (SELECT id FROM functions WHERE path = ?)') : null;
 const deleteEdgesByPath = incremental ? db.prepare('DELETE FROM edges WHERE src_id IN (SELECT id FROM functions WHERE path = ?)') : null;
 const deleteClausesByPath = incremental ? db.prepare('DELETE FROM clauses WHERE function_id IN (SELECT id FROM functions WHERE path = ?)') : null;
+
+// Normalize a call record from the exporter into a flat edge payload.
+// Accepts the Tier 2 object form ({callee, dst_clause, attribution,
+// dispatch, line}) and the legacy string form ("Mod.fun/arity").
+function normalizeCall(rawCall) {
+  if (typeof rawCall === 'string') {
+    return { callee: rawCall, dst_clause: null, attribution: null, dispatch: null, line: null };
+  }
+  if (rawCall && typeof rawCall === 'object') {
+    return {
+      callee: rawCall.callee || rawCall.mfa || null,
+      dst_clause: rawCall.dst_clause != null ? rawCall.dst_clause : null,
+      attribution: rawCall.attribution != null ? rawCall.attribution : null,
+      dispatch: rawCall.dispatch != null ? rawCall.dispatch : null,
+      line: rawCall.line != null ? rawCall.line : (rawCall.call_line != null ? rawCall.call_line : null)
+    };
+  }
+  return { callee: null, dst_clause: null, attribution: null, dispatch: null, line: null };
+}
+
+// Additive migration for the edges table: add Tier 2 columns if they're
+// missing on an older database. Idempotent.
+function ensureEdgeColumns(database) {
+  const cols = new Set(database.prepare('PRAGMA table_info(edges)').all().map(c => c.name));
+  const additions = [
+    ['dst_clause', 'INTEGER'],
+    ['attribution', 'TEXT'],
+    ['dispatch', 'TEXT'],
+    ['call_line', 'INTEGER']
+  ];
+  for (const [name, type] of additions) {
+    if (!cols.has(name)) {
+      database.exec(`ALTER TABLE edges ADD COLUMN ${name} ${type}`);
+    }
+  }
+  try { database.exec('CREATE INDEX IF NOT EXISTS idx_edges_clause ON edges(dst_mfa, dst_clause)'); } catch {}
+}
 
 // Read and process JSONL
 let jsonlContent;
@@ -146,11 +188,14 @@ const transaction = db.transaction(() => {
     // Insert FTS
     insertFts.run(func.id, func.module, func.lexical_text);
 
-    // Insert edges (skip AST artifacts and operator noise)
+    // Insert edges (skip AST artifacts and operator noise). Supports two call
+    // shapes: legacy string ("Mod.fun/arity") and the Tier 2 object form
+    // ({callee, dst_clause, attribution, dispatch, line}).
     const skipEdgePattern = /(?:^|\.)(?:__aliases__|__block__|__MODULE__|__ENV__|__CALLER__|__DIR__|->|\+\+|--|\*\*|::|\.\.|\|>|\\|<\-|<\||\|>|&&|\|\|)\//;
-    for (const call of func.calls || []) {
-      if (skipEdgePattern.test(call)) continue;
-      insertEdge.run(func.id, call, 'call');
+    for (const rawCall of func.calls || []) {
+      const call = normalizeCall(rawCall);
+      if (!call.callee || skipEdgePattern.test(call.callee)) continue;
+      insertEdge.run(func.id, call.callee, 'call', call.dst_clause, call.attribution, call.dispatch, call.line);
     }
 
     // Insert clause manifest (multi-clause functions enumerate every clause)
