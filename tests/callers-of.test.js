@@ -194,4 +194,41 @@ describeIntegration('export -> ingest -> query (indexer fixes)', () => {
       db.close();
     } finally { teardown(); }
   });
+
+  // ---- Tier 1: clause enumeration ----
+
+  it('clause enumeration: multi-clause function emits one clause row per clause', () => {
+    setup();
+    try {
+      build();
+      const db = openDb();
+      const clauses = db.prepare(`
+        SELECT c.ordinal o, c.signature s, c.start_line l
+        FROM clauses c JOIN functions f ON f.id = c.function_id
+        WHERE f.name = ? ORDER BY c.ordinal
+      `).all('handle_call');
+      // Before Tier 1, handle_call collapsed to its first clause only.
+      expect(clauses.map(c => c.s)).toEqual([
+        'handle_call(:conn, _from, state)',
+        'handle_call(:disconnect, _from, state)',
+        'handle_call({:query, sql}, _from, state)'
+      ]);
+      expect(clauses.map(c => c.o)).toEqual([1, 2, 3]);
+      db.close();
+    } finally { teardown(); }
+  });
+
+  it('clause enumeration: single-clause function still records its one clause', () => {
+    setup();
+    try {
+      build();
+      const db = openDb();
+      const n = db.prepare(`
+        SELECT count(*) as c FROM clauses c JOIN functions f ON f.id = c.function_id
+        WHERE f.name = ?
+      `).get('enrich_issue').c;
+      expect(n).toBe(1);
+      db.close();
+    } finally { teardown(); }
+  });
 });

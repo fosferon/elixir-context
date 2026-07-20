@@ -24,15 +24,18 @@ if (!incremental) {
   // Full rebuild: drop and recreate for clean state
   db.exec('DROP TABLE IF EXISTS functions');
   db.exec('DROP TABLE IF EXISTS edges');
+  db.exec('DROP TABLE IF EXISTS clauses');
   db.exec('DROP TABLE IF EXISTS functions_fts');
 
   db.exec('CREATE TABLE functions (id TEXT PRIMARY KEY, module TEXT, name TEXT, arity INTEGER, kind TEXT DEFAULT \'function\', path TEXT, start_line INTEGER, end_line INTEGER, signature TEXT, spec TEXT, doc TEXT, lexical_text TEXT, struct_text TEXT)');
   db.exec('CREATE TABLE edges (src_id TEXT, dst_mfa TEXT, kind TEXT, UNIQUE(src_id, dst_mfa, kind))');
+  db.exec('CREATE TABLE clauses (id TEXT PRIMARY KEY, function_id TEXT, ordinal INTEGER, start_line INTEGER, end_line INTEGER, signature TEXT)');
   db.exec('CREATE VIRTUAL TABLE functions_fts USING fts5(id, module, lexical_text)');
   db.exec('CREATE INDEX idx_functions_module_name_arity ON functions(module, name, arity)');
   db.exec('CREATE INDEX idx_functions_path ON functions(path)');
   db.exec('CREATE INDEX idx_functions_kind ON functions(kind)');
   db.exec('CREATE INDEX idx_edges_dst ON edges(dst_mfa)');
+  db.exec('CREATE INDEX idx_clauses_function ON clauses(function_id)');
 } else {
   // Incremental: ensure tables exist (no-op if they do)
   try {
@@ -41,6 +44,9 @@ if (!incremental) {
     console.error('Database schema missing. Run a full rebuild first (without --incremental).');
     process.exit(1);
   }
+  // clauses table was added after edges; create on demand for older DBs.
+  db.exec('CREATE TABLE IF NOT EXISTS clauses (id TEXT PRIMARY KEY, function_id TEXT, ordinal INTEGER, start_line INTEGER, end_line INTEGER, signature TEXT)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_clauses_function ON clauses(function_id)');
 }
 
 // Prepare statements
@@ -54,6 +60,11 @@ const insertEdge = db.prepare(`
   VALUES (?, ?, ?)
 `);
 
+const insertClause = db.prepare(`
+  INSERT OR REPLACE INTO clauses (id, function_id, ordinal, start_line, end_line, signature)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+
 const insertFts = db.prepare(`
   INSERT OR REPLACE INTO functions_fts (id, module, lexical_text)
   VALUES (?, ?, ?)
@@ -63,6 +74,7 @@ const insertFts = db.prepare(`
 const deleteByPath = incremental ? db.prepare('DELETE FROM functions WHERE path = ?') : null;
 const deleteFtsByIds = incremental ? db.prepare('DELETE FROM functions_fts WHERE id IN (SELECT id FROM functions WHERE path = ?)') : null;
 const deleteEdgesByPath = incremental ? db.prepare('DELETE FROM edges WHERE src_id IN (SELECT id FROM functions WHERE path = ?)') : null;
+const deleteClausesByPath = incremental ? db.prepare('DELETE FROM clauses WHERE function_id IN (SELECT id FROM functions WHERE path = ?)') : null;
 
 // Read and process JSONL
 let jsonlContent;
@@ -92,10 +104,11 @@ const transaction = db.transaction(() => {
         if (func.path) affectedPaths.add(func.path);
       } catch (e) { /* skip malformed */ }
     }
-    // Delete old entries for all affected files (order matters: FTS refs → edges → functions)
+    // Delete old entries for all affected files (order matters: FTS refs → edges → clauses → functions)
     for (const p of affectedPaths) {
       deleteFtsByIds.run(p);
       deleteEdgesByPath.run(p);
+      deleteClausesByPath.run(p);
       deleteByPath.run(p);
     }
   }
@@ -138,6 +151,13 @@ const transaction = db.transaction(() => {
     for (const call of func.calls || []) {
       if (skipEdgePattern.test(call)) continue;
       insertEdge.run(func.id, call, 'call');
+    }
+
+    // Insert clause manifest (multi-clause functions enumerate every clause)
+    if (Array.isArray(func.clauses)) {
+      for (const c of func.clauses) {
+        insertClause.run(`${func.id}#c${c.ordinal}`, func.id, c.ordinal, c.start_line, c.end_line, c.signature);
+      }
     }
     count++;
   }

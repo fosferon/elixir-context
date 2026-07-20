@@ -24,9 +24,22 @@ function initDB() {
       logger.warn('Database file does not exist; some tools may not work until index is built', { dbFile });
     }
     db = new Database(dbFile);
+    migrateSchema();
   } catch (err) {
     logger.error('Failed to open database', { dbFile, err: err.message });
     db = null;
+  }
+}
+
+// Additive schema migrations so a running server picks up new tables/columns
+// added by newer exporters without forcing a manual nuke. Idempotent.
+function migrateSchema() {
+  if (!db) return;
+  try {
+    db.exec('CREATE TABLE IF NOT EXISTS clauses (id TEXT PRIMARY KEY, function_id TEXT, ordinal INTEGER, start_line INTEGER, end_line INTEGER, signature TEXT)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_clauses_function ON clauses(function_id)');
+  } catch (err) {
+    logger.warn('schema migration partial', { err: err.message });
   }
 }
 
@@ -278,6 +291,42 @@ async function handleSearch(params) {
 }
 
 
+// Fetch the clause manifest for a function, ordered by ordinal. Returns [] if
+// the function has no recorded clauses (older index, non-def kind, or missing).
+function getClausesFor(module, name, arity) {
+  try {
+    return db.prepare(`
+      SELECT c.ordinal, c.signature, c.start_line, c.end_line
+      FROM clauses c
+      JOIN functions f ON f.id = c.function_id
+      WHERE f.module = ? AND f.name = ? AND f.arity = ?
+      ORDER BY c.ordinal
+    `).all(module, name, arity).map(c => ({
+      ordinal: c.ordinal,
+      signature: c.signature,
+      start_line: c.start_line,
+      end_line: c.end_line
+    }));
+  } catch (err) {
+    return [];
+  }
+}
+
+// Fetch clauses by function id.
+function getClausesForId(functionId) {
+  try {
+    return db.prepare(`
+      SELECT ordinal, signature, start_line, end_line
+      FROM clauses WHERE function_id = ? ORDER BY ordinal
+    `).all(functionId).map(c => ({
+      ordinal: c.ordinal, signature: c.signature,
+      start_line: c.start_line, end_line: c.end_line
+    }));
+  } catch (err) {
+    return [];
+  }
+}
+
 function handlePackContext(params) {
   if (!db) throw new Error('Database not initialized');
   let results;
@@ -306,6 +355,15 @@ function handlePackContext(params) {
     text += `Path: ${row.path}:${row.start_line}\n`;
     if (row.spec) text += `Spec: ${row.spec}\n`;
     if (row.doc) text += `Doc: ${row.doc}\n`;
+    // Surface every clause head so multi-clause functions (callbacks, protocol
+    // impls, fsm handlers) are visible instead of collapsing to clause 1.
+    const clauses = getClausesForId(row.id);
+    if (clauses.length > 1) {
+      text += `Clauses (${clauses.length}):\n`;
+      for (const c of clauses) {
+        text += `  ${c.ordinal}. ${c.signature}  L${c.start_line}${c.end_line && c.end_line !== c.start_line ? '-' + c.end_line : ''}\n`;
+      }
+    }
     text += `Definition: ${row.struct_text}\n\n`;
     sources.push({ path: row.path, start_line: row.start_line, end_line: row.end_line || row.start_line });
   }
@@ -344,7 +402,37 @@ function handleCallersOf(params) {
   `);
   const rows = q.all(target, k);
 
-  // Group by target for readability
+  // Resolve the target to actual indexed functions (def-kinds only) and
+  // attach each one's clause manifest. This is independent of the edges query
+  // so a target with ZERO indexed callers (e.g. a GenServer callback reached
+  // only via dispatch) still surfaces its full clause set — which is the whole
+  // point for the "multi-clause collapse" use case.
+  const targetFuncs = (() => {
+    try {
+      const rows = db.prepare(`
+        SELECT id, module, name, arity, signature
+        FROM functions
+        WHERE kind IN ('function','function_private','macro','macro_private')
+          AND (module || '.' || name || '/' || arity) LIKE ?
+        ORDER BY module, name, arity
+        LIMIT 100
+      `).all(target);
+      return rows.map(f => {
+        const clauses = getClausesForId(f.id);
+        return {
+          target: `${f.module}.${f.name}/${f.arity}`,
+          module: f.module, name: f.name, arity: f.arity,
+          signature: f.signature,
+          clause_count: clauses.length,
+          clauses
+        };
+      });
+    } catch (err) {
+      return [];
+    }
+  })();
+
+  // Group caller edges by target for readability
   const grouped = {};
   for (const r of rows) {
     const key = r.target;
@@ -359,7 +447,8 @@ function handleCallersOf(params) {
     query: rawTarget,
     resolved_pattern: target,
     total_matches: rows.length,
-    targets: Object.entries(grouped).map(([target, callers]) => ({ target, callers }))
+    targets: Object.entries(grouped).map(([target, callers]) => ({ target, callers })),
+    target_functions: targetFuncs
   };
 }
 
