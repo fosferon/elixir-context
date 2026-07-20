@@ -16,8 +16,6 @@ function normalizeCallersTarget(raw) {
 
 describe('normalizeCallersTarget', () => {
   it('expands a bare Module.function to match all arities', () => {
-    // The regression: stored dst_mfa is always "Mod.fun/arity", so a bare
-    // "Mod.fun" with no slash silently matched NOTHING. This is the fix.
     expect(normalizeCallersTarget('Bee.Repo.enrich_issue')).toBe('Bee.Repo.enrich_issue/%');
     expect(normalizeCallersTarget('WorkflowEngine.advance_execution')).toBe('WorkflowEngine.advance_execution/%');
   });
@@ -31,9 +29,7 @@ describe('normalizeCallersTarget', () => {
     expect(normalizeCallersTarget('Repo.insert/%')).toBe('Repo.insert/%');
   });
 
-  it('leaves module/function wildcards (no slash) expanded via /%', () => {
-    // Module-wildcard with no slash still gets /% appended; LIKE semantics
-    // make this match any arity because % spans slashes.
+  it('expands module/function wildcards (no slash) via /%', () => {
     expect(normalizeCallersTarget('WorkflowEngine.%')).toBe('WorkflowEngine.%/%');
     expect(normalizeCallersTarget('%.advance_execution')).toBe('%.advance_execution/%');
   });
@@ -60,10 +56,8 @@ describe('normalizeCallersTarget', () => {
   });
 });
 
-// --- End-to-end integration test: export.exs -> ingest.js -> sqlite ---
-// Verifies the two indexer-level fixes (self-edge removal + dot-call filter)
-// against the real toolchain. Skipped automatically when elixir isn't on PATH
-// so this doesn't break environments without Elixir installed.
+// --- End-to-end integration: export.exs -> ingest.js -> sqlite ---
+// Covers all three tiers. Skipped automatically when elixir isn't on PATH.
 
 import { spawnSync } from 'child_process';
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
@@ -75,34 +69,42 @@ const require = createRequire(import.meta.url);
 const REPO = require('path').resolve(__dirname, '..');
 
 function elixirAvailable() {
-  const r = spawnSync('which', ['elixir'], { stdio: 'ignore' });
-  return r.status === 0;
+  return spawnSync('which', ['elixir'], { stdio: 'ignore' }).status === 0;
 }
 
 const FIXTURE = `defmodule Bee.Repo do
   use GenServer
 
-  # Multi-clause handle_call — the surface gc_daemon reportedly hits
   def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
   def handle_call(:disconnect, _from, state), do: {:reply, :ok, state}
   def handle_call({:query, sql}, _from, state), do: {:reply, run(sql), state}
 
-  # A function that IS called from elsewhere
   def enrich_issue(issue), do: {:ok, issue}
-
-  # A function that calls enrich_issue
   def sync(issue), do: enrich_issue(issue)
-
-  # A genuinely DEAD function (defined, never called anywhere)
   defp totally_dead(x), do: x
-
   def run(sql), do: sql
+end
+
+defmodule GcDaemon do
+  def route(:start), do: :ok
+  def route({:advance, id}), do: {:ok, id}
+  def route(other), do: {:error, other}
+
+  def caller_a do
+    route(:start)
+    route({:advance, 42})
+    route(:unknown)
+  end
+
+  def ping_conn, do: GenServer.call(Bee.Repo, :conn)
+  def query(sql), do: GenServer.call(Bee.Repo, {:query, sql})
+  def vague(msg), do: GenServer.call(Bee.Repo, msg)
 end
 `;
 
 const describeIntegration = elixirAvailable() ? describe : describe.skip;
 
-describeIntegration('export -> ingest -> query (indexer fixes)', () => {
+describeIntegration('export -> ingest -> query (all tiers)', () => {
   let tmpDir, dbPath;
 
   function setup() {
@@ -111,124 +113,141 @@ describeIntegration('export -> ingest -> query (indexer fixes)', () => {
     writeFileSync(join(tmpDir, 'lib', 'repro.ex'), FIXTURE);
     dbPath = join(tmpDir, 'ec.sqlite');
   }
-
-  function teardown() {
-    try { rmSync(tmpDir, { recursive: true }); } catch {}
-  }
+  function teardown() { try { rmSync(tmpDir, { recursive: true }); } catch {} }
 
   function build() {
-    const exportScript = join(REPO, 'scripts', 'export.exs');
-    const ingestScript = join(REPO, 'scripts', 'ingest.js');
     const jsonl = join(tmpDir, 'export.jsonl');
-    const e = spawnSync('elixir', [exportScript, '--file', join(tmpDir, 'lib', 'repro.ex'), '--quiet', '--out', jsonl], { encoding: 'utf8' });
+    const e = spawnSync('elixir', [join(REPO, 'scripts', 'export.exs'), '--file', join(tmpDir, 'lib', 'repro.ex'), '--quiet', '--out', jsonl], { encoding: 'utf8' });
     if (e.status !== 0) throw new Error('export failed: ' + e.stderr);
-    expect(existsSync(jsonl)).toBe(true);
-    const i = spawnSync('node', [ingestScript, jsonl, dbPath], { encoding: 'utf8' });
+    const i = spawnSync('node', [join(REPO, 'scripts', 'ingest.js'), jsonl, dbPath], { encoding: 'utf8' });
     if (i.status !== 0) throw new Error('ingest failed: ' + i.stderr);
   }
-
   function openDb() {
     const Database = require(join(REPO, 'node_modules', 'better-sqlite3'));
     return new Database(dbPath, { readonly: true });
   }
-
   function callersOf(db, rawTarget) {
     const t = normalizeCallersTarget(rawTarget);
-    return db.prepare(
-      `SELECT e.dst_mfa target, f.module m, f.name n, f.arity a
+    return db.prepare(`SELECT e.dst_mfa target, f.module m, f.name n, f.arity a
+       FROM edges e JOIN functions f ON f.id = e.src_id WHERE e.dst_mfa LIKE ?`).all(t).map(r => `${r.m}.${r.n}/${r.a}`);
+  }
+  function attributedEdges(db, callerName, calleeMfa) {
+    return db.prepare(`SELECT e.dst_clause clause, e.attribution attr, e.dispatch dispatch, e.call_line line
        FROM edges e JOIN functions f ON f.id = e.src_id
-       WHERE e.dst_mfa LIKE ?`
-    ).all(t).map(r => `${r.m}.${r.n}/${r.a}`);
+       WHERE f.name = ? AND e.dst_mfa = ? ORDER BY e.call_line`).all(callerName, calleeMfa);
   }
 
+  // ---- Batch 1: stop lying ----
+
   it('self-edge fix: a genuinely dead function has ZERO callers', () => {
-    setup();
-    try {
-      build();
-      const db = openDb();
-      // totally_dead/1 is defined but called from nowhere. Before the fix it
-      // reported exactly one caller — itself — making it indistinguishable
-      // from live code. Now it must report zero.
-      const callers = callersOf(db, 'Bee.Repo.totally_dead/%');
-      expect(callers).toEqual([]);
-      db.close();
-    } finally { teardown(); }
+    setup(); try { build(); const db = openDb();
+      expect(callersOf(db, 'Bee.Repo.totally_dead/%')).toEqual([]);
+    db.close(); } finally { teardown(); }
   });
 
   it('self-edge fix: live function reports only its REAL caller, not itself', () => {
-    setup();
-    try {
-      build();
-      const db = openDb();
-      const callers = callersOf(db, 'Bee.Repo.enrich_issue/%');
-      expect(callers).toEqual(['Bee.Repo.sync/1']);
-      db.close();
-    } finally { teardown(); }
+    setup(); try { build(); const db = openDb();
+      expect(callersOf(db, 'Bee.Repo.enrich_issue/%')).toEqual(['Bee.Repo.sync/1']);
+    db.close(); } finally { teardown(); }
   });
 
   it('dot-call fix: variable field access (state.conn) is not recorded as a call edge', () => {
-    setup();
-    try {
-      build();
-      const db = openDb();
-      const bad = db.prepare(`SELECT count(*) as c FROM edges WHERE dst_mfa LIKE '%state.conn%'`).get().c;
-      expect(bad).toBe(0);
-      db.close();
-    } finally { teardown(); }
+    setup(); try { build(); const db = openDb();
+      expect(db.prepare(`SELECT count(*) as c FROM edges WHERE dst_mfa LIKE '%state.conn%'`).get().c).toBe(0);
+    db.close(); } finally { teardown(); }
   });
 
-  it('bare-target fix: callers_of "Module.function" (no arity) returns real callers, not zero', () => {
-    // Guards against the silent-zero regression end-to-end through the
-    // exported data shape (dst_mfa is always "Mod.fun/arity").
-    setup();
-    try {
-      build();
-      const db = openDb();
-      // Without normalization, the bare LIKE would match nothing.
-      const bare = db.prepare(
-        `SELECT count(*) as c FROM edges WHERE dst_mfa LIKE ?`
-      ).get('Bee.Repo.enrich_issue').c;
-      expect(bare).toBe(0); // raw LIKE still misses — proves why normalization is required
-      const normalized = callersOf(db, 'Bee.Repo.enrich_issue');
-      expect(normalized).toEqual(['Bee.Repo.sync/1']);
-      db.close();
-    } finally { teardown(); }
+  it('bare-target fix: bare LIKE misses, normalization returns real callers', () => {
+    setup(); try { build(); const db = openDb();
+      expect(db.prepare(`SELECT count(*) as c FROM edges WHERE dst_mfa LIKE ?`).get('Bee.Repo.enrich_issue').c).toBe(0);
+      expect(callersOf(db, 'Bee.Repo.enrich_issue')).toEqual(['Bee.Repo.sync/1']);
+    db.close(); } finally { teardown(); }
   });
 
   // ---- Tier 1: clause enumeration ----
 
   it('clause enumeration: multi-clause function emits one clause row per clause', () => {
-    setup();
-    try {
-      build();
-      const db = openDb();
-      const clauses = db.prepare(`
-        SELECT c.ordinal o, c.signature s, c.start_line l
-        FROM clauses c JOIN functions f ON f.id = c.function_id
-        WHERE f.name = ? ORDER BY c.ordinal
-      `).all('handle_call');
-      // Before Tier 1, handle_call collapsed to its first clause only.
-      expect(clauses.map(c => c.s)).toEqual([
+    setup(); try { build(); const db = openDb();
+      const clauses = db.prepare(`SELECT c.signature s FROM clauses c JOIN functions f ON f.id = c.function_id
+        WHERE f.name = ? ORDER BY c.ordinal`).all('handle_call').map(c => c.s);
+      expect(clauses).toEqual([
         'handle_call(:conn, _from, state)',
         'handle_call(:disconnect, _from, state)',
         'handle_call({:query, sql}, _from, state)'
       ]);
-      expect(clauses.map(c => c.o)).toEqual([1, 2, 3]);
-      db.close();
-    } finally { teardown(); }
+    db.close(); } finally { teardown(); }
   });
 
   it('clause enumeration: single-clause function still records its one clause', () => {
-    setup();
+    setup(); try { build(); const db = openDb();
+      expect(db.prepare(`SELECT count(*) as c FROM clauses c JOIN functions f ON f.id = c.function_id WHERE f.name = ?`).get('enrich_issue').c).toBe(1);
+    db.close(); } finally { teardown(); }
+  });
+
+  // ---- Tier 2: direct call-site clause attribution ----
+
+  it('Tier 2: direct literal call attributes to the matching clause (first-match-wins)', () => {
+    setup(); try { build(); const db = openDb();
+      // Three call sites into route/1, each resolving to a distinct clause
+      // despite the trailing var catch-all clause.
+      const edges = attributedEdges(db, 'caller_a', 'GcDaemon.route/1');
+      expect(edges.map(e => e.clause).sort((a, b) => a - b)).toEqual([1, 2, 3]);
+      expect(edges.every(e => e.attr === 'direct')).toBe(true);
+      expect(edges.every(e => e.dispatch === null)).toBe(true);
+    db.close(); } finally { teardown(); }
+  });
+
+  // ---- Tier 3: OTP dispatch attribution ----
+
+  it('Tier 3: GenServer.call attributes to the specific handle_call clause', () => {
+    setup(); try { build(); const db = openDb();
+      const conn = attributedEdges(db, 'ping_conn', 'Bee.Repo.handle_call/3');
+      expect(conn).toHaveLength(1);
+      expect(conn[0].clause).toBe(1);
+      expect(conn[0].attr).toBe('dispatch');
+      expect(conn[0].dispatch).toBe('GenServer.call');
+
+      const q = attributedEdges(db, 'query', 'Bee.Repo.handle_call/3');
+      expect(q).toHaveLength(1);
+      expect(q[0].clause).toBe(3);
+      expect(q[0].attr).toBe('dispatch');
+
+      const v = attributedEdges(db, 'vague', 'Bee.Repo.handle_call/3');
+      expect(v).toHaveLength(1);
+      expect(v[0].attr).toBe('ambiguous'); // variable message -> can't tell
+    db.close(); } finally { teardown(); }
+  });
+
+  it('Tier 3: dispatch edges all carry the dispatch label (no arity-level noise for handle_call)', () => {
+    setup(); try { build(); const db = openDb();
+      const noise = db.prepare(`SELECT count(*) as c FROM edges WHERE dst_mfa LIKE '%.handle_call/%' AND attribution IS NULL`).get().c;
+      expect(noise).toBe(0);
+    db.close(); } finally { teardown(); }
+  });
+
+  // ---- Backward compatibility ----
+
+  it('legacy shape: exporter string calls still ingest as arity-level edges', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'ec-legacy-'));
     try {
-      build();
-      const db = openDb();
-      const n = db.prepare(`
-        SELECT count(*) as c FROM clauses c JOIN functions f ON f.id = c.function_id
-        WHERE f.name = ?
-      `).get('enrich_issue').c;
-      expect(n).toBe(1);
+      const def = {
+        id: 'legacy1', module: 'X', name: 'a', arity: 0, kind: 'function',
+        path: 'lib/x.ex', start_line: 1, end_line: 1, signature: 'a()',
+        spec: null, doc: null, lexical_text: 'X.a', struct_text: 'def a, do: b()',
+        calls: ['X.b/0']
+      };
+      const jsonl = join(tmp, 'legacy.jsonl');
+      writeFileSync(jsonl, JSON.stringify(def) + '\n');
+      const dbPath = join(tmp, 'legacy.sqlite');
+      const i = spawnSync('node', [join(REPO, 'scripts', 'ingest.js'), jsonl, dbPath], { encoding: 'utf8' });
+      expect(i.status).toBe(0);
+      const Database = require(join(REPO, 'node_modules', 'better-sqlite3'));
+      const db = new Database(dbPath, { readonly: true });
+      const edge = db.prepare('SELECT dst_mfa, dst_clause, attribution, dispatch, call_line FROM edges').get();
+      expect(edge.dst_mfa).toBe('X.b/0');
+      expect(edge.dst_clause).toBeNull();
+      expect(edge.attribution).toBeNull();
       db.close();
-    } finally { teardown(); }
+    } finally { rmSync(tmp, { recursive: true }); }
   });
 });

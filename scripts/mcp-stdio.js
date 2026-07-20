@@ -38,6 +38,12 @@ function migrateSchema() {
   try {
     db.exec('CREATE TABLE IF NOT EXISTS clauses (id TEXT PRIMARY KEY, function_id TEXT, ordinal INTEGER, start_line INTEGER, end_line INTEGER, signature TEXT)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_clauses_function ON clauses(function_id)');
+    // Tier 2: edges gained dst_clause/attribution/dispatch/call_line.
+    const cols = new Set(db.prepare('PRAGMA table_info(edges)').all().map(c => c.name));
+    for (const [name, type] of [['dst_clause','INTEGER'],['attribution','TEXT'],['dispatch','TEXT'],['call_line','INTEGER']]) {
+      if (!cols.has(name)) db.exec(`ALTER TABLE edges ADD COLUMN ${name} ${type}`);
+    }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_edges_clause ON edges(dst_mfa, dst_clause)');
   } catch (err) {
     logger.warn('schema migration partial', { err: err.message });
   }
@@ -114,7 +120,7 @@ function handleToolsList(id) {
         },
         {
           name: "elixir_context_callers_of",
-          description: "Find all functions that call a given Module.function/arity. Queries the call-edge index for reverse lookups (who references this symbol). Target forms accepted: bare 'Module.function' (matches ALL arities), 'Module.function/2' (exact arity), or any wildcard form like 'WorkflowEngine.%', '%.advance_execution%', 'Repo.insert/%'. Bare form is auto-expanded to match every arity.",
+          description: "Find all functions that call a given Module.function/arity, with clause-level attribution where resolvable. Queries the call-edge index for reverse lookups. Target forms: bare 'Module.function' (all arities), 'Module.function/2' (exact), or any wildcard ('WorkflowEngine.%', '%.advance_execution%'). Each caller-edge carries its attributed clause ordinal + confidence (attribution: direct|dispatch|ambiguous|null) and dispatch shape (e.g. 'GenServer.call') when the call reaches the target via OTP dispatch. The response also includes target_functions[] with each target's full clause manifest, so a callback with zero indexed callers still surfaces its clause heads.",
           inputSchema: {
             type: "object",
             properties: {
@@ -126,7 +132,7 @@ function handleToolsList(id) {
         },
         {
           name: "elixir_context_calls_from",
-          description: "Find all functions called BY a given function. Queries the call-edge index for forward lookups (what does this symbol invoke). Accepts: id (sha256), module+name as separate fields, or target as 'Module.function' dotted string.",
+          description: "Find all functions called BY a given function, one edge per call site with clause attribution. Accepts: id (sha256), module+name, or target as 'Module.function' / 'Module.function/arity'. Each returned call carries {callee, clause, attribution (direct|dispatch|ambiguous|null), dispatch, line}.",
           inputSchema: {
             type: "object",
             properties: {
@@ -393,11 +399,12 @@ function handleCallersOf(params) {
 
   // Query edges where dst_mfa matches (supports SQL LIKE wildcards)
   const q = db.prepare(`
-    SELECT e.dst_mfa as target, f.id, f.module, f.name, f.arity, f.kind, f.path, f.start_line, f.signature
+    SELECT e.dst_mfa as target, f.id, f.module, f.name, f.arity, f.kind, f.path, f.start_line, f.signature,
+           e.dst_clause, e.attribution, e.dispatch, e.call_line
     FROM edges e
     JOIN functions f ON f.id = e.src_id
     WHERE e.dst_mfa LIKE ?
-    ORDER BY f.module, f.name
+    ORDER BY f.module, f.name, e.call_line
     LIMIT ?
   `);
   const rows = q.all(target, k);
@@ -432,14 +439,30 @@ function handleCallersOf(params) {
     }
   })();
 
-  // Group caller edges by target for readability
+  // Index target clause signatures by mfa so per-edge attribution can resolve
+  // to a concrete clause head without a second query per row.
+  const clauseSigByTarget = {};
+  for (const tf of targetFuncs) {
+    clauseSigByTarget[tf.target] = (tf.clauses || []).map(c => c.signature);
+  }
+
+  // Group caller edges by target. Each row is one caller-edge (a call site),
+  // so a caller with multiple call sites into the same target produces one
+  // entry per site — carrying its attributed clause + dispatch shape.
   const grouped = {};
   for (const r of rows) {
     const key = r.target;
     if (!grouped[key]) grouped[key] = [];
+    const clauseSig = (r.dst_clause && clauseSigByTarget[key])
+      ? clauseSigByTarget[key][r.dst_clause - 1]
+      : null;
     grouped[key].push({
       module: r.module, name: r.name, arity: r.arity, kind: r.kind,
-      path: r.path, line: r.start_line, signature: r.signature
+      path: r.path, line: r.call_line || r.start_line, signature: r.signature,
+      clause: r.dst_clause,
+      clause_signature: clauseSig,
+      attribution: r.attribution,
+      dispatch: r.dispatch
     });
   }
 
@@ -486,15 +509,21 @@ function handleCallsFrom(params) {
   // Get the function itself
   const funcRow = db.prepare('SELECT * FROM functions WHERE id = ?').get(funcId);
 
-  // Get all outgoing edges
+  // Get all outgoing edges (one row per call site, with attribution)
   const q = db.prepare(`
-    SELECT e.dst_mfa as callee
+    SELECT e.dst_mfa as callee, e.dst_clause as clause, e.attribution, e.dispatch, e.call_line as line
     FROM edges e
     WHERE e.src_id = ?
-    ORDER BY e.dst_mfa
+    ORDER BY e.dst_mfa, e.call_line
     LIMIT ?
   `);
-  const callees = q.all(funcId, k).map(r => r.callee);
+  const calls = q.all(funcId, k).map(r => ({
+    callee: r.callee,
+    clause: r.clause,
+    attribution: r.attribution,
+    dispatch: r.dispatch,
+    line: r.line
+  }));
 
   return {
     function: {
@@ -502,8 +531,8 @@ function handleCallsFrom(params) {
       kind: funcRow.kind, path: funcRow.path, line: funcRow.start_line,
       signature: funcRow.signature
     },
-    calls: callees,
-    total: callees.length
+    calls,
+    total: calls.length
   };
 }
 

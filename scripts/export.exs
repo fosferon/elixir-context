@@ -102,7 +102,7 @@ defmodule Exporter do
         sorted = Enum.sort_by(defs, & &1.start_line)
         primary = hd(sorted)
         last = Enum.max_by(defs, & &1.end_line)
-        merged_calls = defs |> Enum.flat_map(& &1.calls) |> Enum.uniq()
+        merged_calls = defs |> Enum.flat_map(& &1.calls) |> Enum.uniq_by(fn s -> {s.callee, s.line} end)
 
         # Build a clause manifest (ordinal, signature, line range) for every
         # clause. Only def-kinds have real clauses; module/use/schema/macro_call
@@ -119,13 +119,37 @@ defmodule Exporter do
                 ordinal: ordinal,
                 signature: d.signature,
                 start_line: d.start_line,
-                end_line: d.end_line || d.start_line
+                end_line: d.end_line || d.start_line,
+                head_patterns: d.head_patterns,
+                guarded: d.guarded
               }
             end)
           Map.put(base, :clauses, clauses)
         else
           base
         end
+      end)
+
+    # Build the clause index from merged functions, then attribute every call
+    # site to the clause(s) it could resolve to. head_patterns/guarded ride on
+    # each clause for this pass and are stripped before emit so the JSONL only
+    # carries the user-visible clause manifest.
+    clause_index =
+      Enum.reduce(unique_defs, %{}, fn d, acc ->
+        key = {d.module, d.name, d.arity}
+        Enum.reduce(Map.get(d, :clauses) || [], acc, fn c, acc2 ->
+          entry = {c.ordinal, c.head_patterns, c.guarded}
+          Map.update(acc2, key, [entry], fn existing -> existing ++ [entry] end)
+        end)
+      end)
+
+    unique_defs =
+      Enum.map(unique_defs, fn d ->
+        attributed = Enum.map(d.calls, &attribute_call(&1, clause_index))
+        d_clauses = Map.get(d, :clauses)
+        clean_clauses = Enum.map(d_clauses || [], &Map.drop(&1, [:head_patterns, :guarded]))
+        d2 = %{d | calls: attributed}
+        if d_clauses, do: %{d2 | clauses: clean_clauses}, else: d2
       end)
 
     if out_path do
@@ -419,6 +443,16 @@ defmodule Exporter do
     spec = Map.get(attrs, :pending_spec)
     doc = Map.get(attrs, :pending_doc)
 
+    # Whether this clause has a `when` guard. Guarded clauses can't be
+    # definitively attributed to a call site (the guard may fail at runtime),
+    # so the attribution pass treats a structural match against a guarded
+    # clause as :unknown rather than :match.
+    guarded = match?({_, _, [{:when, _, _} | _]}, node)
+
+    # Normalized head patterns (one per arg) used by the clause-attribution
+    # pass to unify against call-site argument patterns. See norm_pat/2.
+    head_patterns = Enum.map(args_list, &norm_pat(&1, module_name))
+
     body_keywords = if body_list, do: extract_body_keywords(body_list, 30), else: []
 
     lexical_parts = [
@@ -446,7 +480,9 @@ defmodule Exporter do
       doc: doc,
       lexical_text: lexical_text,
       struct_text: struct_text,
-      calls: calls
+      calls: calls,
+      head_patterns: head_patterns,
+      guarded: guarded
     }
   end
 
@@ -490,26 +526,24 @@ defmodule Exporter do
       end
 
     Macro.prewalk(node, [], fn
-      # Explicit module call: Module.function(args) — but only when the dot's
-      # left side is an actual module reference. A variable dot-access like
-      # `state.conn` parses as {{:., _, [{:state, _, _}, :conn]}, _, []} and is
-      # NOT a function call; without this guard it was recorded as "state.conn/0".
-      {{:., _, [module, func]}, _meta, args} = call, acc when is_list(args) ->
-        if module_ref?(module) do
-          resolved = if module == :__MODULE__, do: module_name, else: module_to_string(module)
-          mfa = "#{resolved}.#{func}/#{length(args)}"
-          {call, [mfa | acc]}
-        else
-          {call, acc}
+      # Explicit module call: Module.function(args). Also detects OTP dispatch
+      # shapes (GenServer.call/cast, :gen_server.call/cast) and rewrites them
+      # into an edge to the server's handle_call/handle_cast callback, carrying
+      # the message arg so the clause-attribution pass can resolve the clause.
+      {{:., _, [module, func]}, meta, args} = call, acc when is_list(args) ->
+        case make_remote_site(module, func, args, module_name, meta[:line]) do
+          {:ok, site} -> {call, [site | acc]}
+          :skip -> {call, acc}
         end
 
       # Pipelined local call captured as dot: .function(args)
-      {{:., _, [func]}, _meta, args} = call, acc when is_list(args) and is_atom(func) ->
-        mfa = "#{func}/#{length(args)}"
-        {call, [mfa | acc]}
+      {{:., _, [func]}, meta, args} = call, acc when is_list(args) and is_atom(func) ->
+        site = %{callee: "#{func}/#{length(args)}", line: meta[:line],
+                 arg_patterns: Enum.map(args, &norm_pat(&1, module_name)), dispatch: nil}
+        {call, [site | acc]}
 
       # Bare local call: function_name(args) — resolve to module if known
-      {name, _meta, args} = call, acc when is_atom(name) and is_list(args) and not is_nil(module_name) ->
+      {name, meta, args} = call, acc when is_atom(name) and is_list(args) and not is_nil(module_name) ->
         name_str = to_string(name)
         cond do
           # Skip single-char atoms (operators like :e, :a)
@@ -520,16 +554,17 @@ defmodule Exporter do
           MapSet.member?(@skip_names, name) -> {call, acc}
           # Likely a local call (defp/def in same module) — record as Module.name/arity
           true ->
-            mfa = "#{module_name}.#{name}/#{length(args)}"
-            {call, [mfa | acc]}
+            site = %{callee: "#{module_name}.#{name}/#{length(args)}", line: meta[:line],
+                     arg_patterns: Enum.map(args, &norm_pat(&1, module_name)), dispatch: nil}
+            {call, [site | acc]}
         end
 
       call, acc ->
         {call, acc}
     end)
     |> elem(1)
-    |> Enum.reject(&(&1 == self_mfa))
-    |> Enum.uniq()
+    |> Enum.reject(fn site -> site.callee == self_mfa end)
+    |> Enum.uniq_by(fn site -> {site.callee, site.line} end)
   end
 
   # A node in the "module" position of a dotted call is a real module reference
@@ -537,9 +572,218 @@ defmodule Exporter do
   # :lists, :ets). Variable nodes are 3-tuples {name, meta, ctx} and fall through
   # to false, which is what we want.
   defp module_ref?({:__aliases__, _, _}), do: true
+  defp module_ref?({:__MODULE__, _, _}), do: true
   defp module_ref?(:__MODULE__), do: true
   defp module_ref?(atom) when is_atom(atom), do: true
   defp module_ref?(_), do: false
+
+  # Resolve a module-reference node to its dotted string. __MODULE__ (in either
+  # AST form — bare atom or 3-tuple) resolves to the enclosing module name.
+  defp resolve_module({:__aliases__, _, parts}, _) when is_list(parts),
+    do: Enum.map_join(parts, ".", &to_string/1)
+  defp resolve_module({:__MODULE__, _, _}, module_name), do: module_name
+  defp resolve_module(:__MODULE__, module_name), do: module_name
+  defp resolve_module(atom, _) when is_atom(atom), do: to_string(atom)
+  defp resolve_module(other, _), do: module_to_string(other)
+
+  # ------------------------------------------------------------------
+  # Dispatch catalogue (Tier 3)
+  # ------------------------------------------------------------------
+  # Recognise GenServer / :gen_server call/cast and rewrite the edge to the
+  # server's handle_call/handle_cast callback, carrying the message argument
+  # as the first effective-arg pattern so clause attribution can resolve the
+  # clause. Only rewrites when the server arg is statically resolvable to a
+  # module (alias or __MODULE__); a variable or registered-name server yields
+  # :skip — we'd rather drop the edge than emit noise to an unknown module.
+
+  defp make_remote_site(module, func, args, module_name, line) do
+    arity = length(args)
+    cond do
+      is_genserver?(module) and func == :call and arity in [2, 3] ->
+        make_dispatch_site(args, :handle_call, 3, line, "GenServer.call", module_name)
+      is_genserver?(module) and func == :cast and arity == 2 ->
+        make_dispatch_site(args, :handle_cast, 2, line, "GenServer.cast", module_name)
+      module_ref?(module) ->
+        {:ok, %{callee: "#{resolve_module(module, module_name)}.#{func}/#{arity}", line: line,
+                arg_patterns: Enum.map(args, &norm_pat(&1, module_name)), dispatch: nil}}
+      true ->
+        :skip
+    end
+  end
+
+  defp is_genserver?({:__aliases__, _, [:GenServer]}), do: true
+  defp is_genserver?(:gen_server), do: true
+  defp is_genserver?(_), do: false
+
+  defp make_dispatch_site(args, callback, cb_arity, line, label, module_name) do
+    server_ast = Enum.at(args, 0)
+    msg_ast = Enum.at(args, 1)
+    case resolve_server(server_ast, module_name) do
+      nil ->
+        :skip
+      server ->
+        msg_pat = norm_pat(msg_ast, module_name)
+        rest = List.duplicate(%{"t" => "any"}, cb_arity - 1)
+        {:ok, %{callee: "#{server}.#{callback}/#{cb_arity}", line: line,
+                arg_patterns: [msg_pat | rest], dispatch: label}}
+    end
+  end
+
+  defp resolve_server({:__aliases__, _, parts}, _) when is_list(parts),
+    do: Enum.map_join(parts, ".", &to_string/1)
+  defp resolve_server({:__MODULE__, _, _}, module_name), do: module_name
+  defp resolve_server(:__MODULE__, module_name), do: module_name
+  defp resolve_server(_, _), do: nil
+
+  # ------------------------------------------------------------------
+  # Pattern normalization (term language for clause attribution)
+  # ------------------------------------------------------------------
+  # Produces a JSON-encodable map. The attribution pass unifies a call-site
+  # arg pattern against each clause head pattern to decide which clause(s)
+  # could receive the call. Unknown/complex shapes degrade to %{"t"=>"other"}
+  # which conservatively unifies as :unknown (cannot rule the clause out).
+  # Variable nodes are 3-tuples {name, meta, ctx} with an atom context; aliases
+  # are 3-tuples whose third element is a list, so the var clause's guard
+  # (is_atom(ctx)) excludes aliases.
+
+  defp norm_pat(nil, _), do: %{"t" => "nil"}
+  defp norm_pat(true, _), do: %{"t" => "lit", "v" => true}
+  defp norm_pat(false, _), do: %{"t" => "lit", "v" => false}
+  defp norm_pat(:__MODULE__, mod), do: %{"t" => "atom", "v" => mod || "__MODULE__"}
+  defp norm_pat(atom, _) when is_atom(atom), do: %{"t" => "atom", "v" => Atom.to_string(atom)}
+  defp norm_pat(n, _) when is_number(n), do: %{"t" => "num", "v" => n}
+  defp norm_pat(b, _) when is_binary(b), do: %{"t" => "str", "v" => b}
+  defp norm_pat({:{}, _, elems}, mod), do: %{"t" => "tuple", "e" => Enum.map(elems, &norm_pat(&1, mod))}
+  defp norm_pat({a, b}, mod), do: %{"t" => "tuple", "e" => [norm_pat(a, mod), norm_pat(b, mod)]}
+  defp norm_pat(list, mod) when is_list(list), do: %{"t" => "list", "e" => Enum.map(list, &norm_pat(&1, mod))}
+  defp norm_pat({:%{}, _, _}, _), do: %{"t" => "other"}
+  defp norm_pat({:%, _, _}, _), do: %{"t" => "other"}
+  defp norm_pat({:__aliases__, _, parts}, _) when is_list(parts),
+    do: %{"t" => "atom", "v" => Enum.map_join(parts, ".", &to_string/1)}
+  defp norm_pat({:^, _, _}, _), do: %{"t" => "other"}
+  defp norm_pat({:<<>>, _, _}, _), do: %{"t" => "other"}
+  defp norm_pat({name, _, ctx}, _) when is_atom(name) and is_atom(ctx), do: %{"t" => "var"}
+  defp norm_pat(_, _), do: %{"t" => "other"}
+
+  # Unify a call-site pattern with a clause-head pattern.
+  # :match = definitively could receive; :nomatch = ruled out; :unknown =
+  # structurally possible but not provable (var, other, guarded).
+  # Unify a CALL-SITE arg pattern (1st arg) against a CLAUSE-HEAD pattern
+  # (2nd arg). Direction matters:
+  #   - head var   => :match   (catch-all head accepts any call value)
+  #   - call var   => :unknown (call value not statically known)
+  # This is what makes a literal dispatch resolve to its clause even when a
+  # later catch-all clause also structurally matches, while a variable message
+  # stays correctly ambiguous.
+  defp unify(_call, %{"t" => "var"}), do: :match           # head catch-all accepts any call value
+  defp unify(%{"t" => "var"}, _head), do: :unknown         # call value unknown vs concrete head
+  defp unify(%{"t" => "any"}, _head), do: :match            # call-side don't-care (OTP-provided args)
+  defp unify(%{"t" => "other"}, _), do: :unknown
+  defp unify(_, %{"t" => "other"}), do: :unknown
+  defp unify(%{"t" => a}, %{"t" => b}) when a != b, do: :nomatch
+  defp unify(%{"t" => "nil"}, %{"t" => "nil"}), do: :match
+  defp unify(%{"t" => "lit", "v" => v}, %{"t" => "lit", "v" => v}), do: :match
+  defp unify(%{"t" => "lit"}, %{"t" => "lit"}), do: :nomatch
+  defp unify(%{"t" => "atom", "v" => v}, %{"t" => "atom", "v" => v}), do: :match
+  defp unify(%{"t" => "atom"}, %{"t" => "atom"}), do: :nomatch
+  defp unify(%{"t" => "num", "v" => v}, %{"t" => "num", "v" => v}), do: :match
+  defp unify(%{"t" => "num"}, %{"t" => "num"}), do: :nomatch
+  defp unify(%{"t" => "str", "v" => v}, %{"t" => "str", "v" => v}), do: :match
+  defp unify(%{"t" => "str"}, %{"t" => "str"}), do: :nomatch
+  defp unify(%{"t" => "tuple", "e" => e1}, %{"t" => "tuple", "e" => e2}), do: unify_seq(e1, e2)
+  defp unify(%{"t" => "list", "e" => e1}, %{"t" => "list", "e" => e2}), do: unify_seq(e1, e2)
+  defp unify(_, _), do: :unknown
+
+  defp unify_seq(e1, e2) do
+    if length(e1) != length(e2) do
+      :nomatch
+    else
+      Enum.reduce_while(Enum.zip(e1, e2), :match, fn {a, b}, acc ->
+        case unify(a, b) do
+          :nomatch -> {:halt, :nomatch}
+          :unknown -> {:cont, :unknown}
+          :match -> {:cont, acc}
+        end
+      end)
+    end
+  end
+
+  # ------------------------------------------------------------------
+  # Clause attribution
+  # ------------------------------------------------------------------
+  # Given a call site and the global clause index, decide which clause(s) of
+  # the callee could receive this call and stamp dst_clause + attribution onto
+  # the edge. Degrades gracefully: unknown callee or no structural match ->
+  # arity level (dst_clause nil, attribution nil), never a wrong answer.
+
+  defp attribute_call(site, clause_index) do
+    %{callee: callee, arg_patterns: arg_patterns, line: line, dispatch: dispatch} = site
+    base = %{callee: callee, dst_clause: nil, attribution: nil, dispatch: dispatch, line: line}
+
+    case parse_callee(callee) do
+      {:ok, {mod, name, arity}} ->
+        case Map.get(clause_index, {mod, name, arity}) do
+          nil ->
+            base
+          clauses ->
+            ordered = Enum.sort_by(clauses, &elem(&1, 0))
+            results =
+              Enum.map(ordered, fn {ordinal, head_pats, guarded} ->
+                if length(head_pats) != length(arg_patterns) do
+                  {ordinal, :nomatch}
+                else
+                  case unify_seq(arg_patterns, head_pats) do
+                    :nomatch ->
+                      {ordinal, :nomatch}
+                    res ->
+                      res = if guarded and res == :match, do: :unknown, else: res
+                      {ordinal, res}
+                  end
+                end
+              end)
+
+            candidates = Enum.filter(results, fn {_, r} -> r != :nomatch end)
+
+            case candidates do
+              [] ->
+                # structurally ruled out — keep arity-level edge
+                base
+              _ ->
+                # First-match-wins at runtime: the first :match clause with no
+                # preceding :unknown clause is a definite resolution; otherwise
+                # an earlier guarded/unknown clause might have stolen dispatch.
+                case find_definite_winner(results) do
+                  {:ok, ord} ->
+                    %{base | dst_clause: ord, attribution: if(dispatch, do: "dispatch", else: "direct")}
+                  :ambiguous ->
+                    {earliest_ord, _} = hd(candidates)
+                    %{base | dst_clause: earliest_ord, attribution: "ambiguous"}
+                end
+            end
+        end
+
+      :error ->
+        base
+    end
+  end
+
+  # Scan ordered (ordinal, result) pairs; halt at the first :match (definite
+  # runtime winner) or :unknown (blocks definite resolution). :nomatch clauses
+  # are skipped over.
+  defp find_definite_winner(results) do
+    Enum.reduce_while(results, :ambiguous, fn
+      {_ord, :nomatch}, acc -> {:cont, acc}
+      {ord, :match}, _ -> {:halt, {:ok, ord}}
+      {_ord, :unknown}, _ -> {:halt, :ambiguous}
+    end)
+  end
+
+  defp parse_callee(callee) do
+    case Regex.run(~r/^(.*)\.([^.\/]+)\/(\d+)$/, callee) do
+      [_, mod, name, arity] -> {:ok, {mod, name, String.to_integer(arity)}}
+      _ -> :error
+    end
+  end
 
   def module_to_string({:__aliases__, _, aliases}) do
     Enum.map_join(aliases, ".", &to_string/1)
