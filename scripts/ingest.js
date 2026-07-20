@@ -133,8 +133,10 @@ const transaction = db.transaction(() => {
     // Insert FTS
     insertFts.run(func.id, func.module, func.lexical_text);
 
-    // Insert edges
+    // Insert edges (skip AST artifacts and operator noise)
+    const skipEdgePattern = /(?:^|\.)(?:__aliases__|__block__|__MODULE__|__ENV__|__CALLER__|__DIR__|->|\+\+|--|\*\*|::|\.\.|\|>|\\|<\-|<\||\|>|&&|\|\|)\//;
     for (const call of func.calls || []) {
+      if (skipEdgePattern.test(call)) continue;
       insertEdge.run(func.id, call, 'call');
     }
     count++;

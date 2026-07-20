@@ -7,7 +7,10 @@ Application.ensure_all_started(:logger)
 Logger.configure(level: :warning)
 Logger.configure_backend(:console, level: :warning)
 
-Application.ensure_all_started(:jason)
+# Ensure Jason is available (needed for JSON encoding)
+unless Code.ensure_loaded?(Jason) and function_exported?(Jason, :encode!, 1) do
+  Mix.install([:jason])
+end
 
 try do
   if Code.ensure_loaded?(Mix) do
@@ -115,6 +118,10 @@ defmodule Exporter do
       IO.puts(:stderr, "Files: #{total} (#{processed} ok, #{skipped} skipped)")
       IO.puts(:stderr, "Entries: #{length(unique_defs)} — #{inspect(kinds)}")
     end
+
+    if skipped > 0 do
+      System.halt(1)
+    end
   end
 
   def extract_definitions(ast, file) do
@@ -138,8 +145,8 @@ defmodule Exporter do
       safe_prewalk_with_state(body, {[], %{}, %{uses: [], behaviours: [], moduledoc: nil}}, fn
 
         # @moduledoc
-        {:@, _, [{:moduledoc, _, [doc_string]}]} = node, {defs, attrs, meta} when is_binary(doc_string) ->
-          {node, {defs, attrs, %{meta | moduledoc: doc_string}}}
+        {:@, _, [{:moduledoc, _, [doc_string]}]} = node, {defs, attrs, meta} ->
+          {node, {defs, attrs, %{meta | moduledoc: flatten_doc_ast(doc_string)}}}
 
         # @behaviour
         {:@, _, [{:behaviour, _, [behaviour_mod]}]} = node, {defs, attrs, meta} ->
@@ -169,14 +176,31 @@ defmodule Exporter do
 
         # @doc
         {:@, _, [{:doc, _, [doc_string]}]} = node, {defs, attrs, meta} ->
-          {node, {defs, Map.put(attrs, :pending_doc, doc_string), meta}}
+          {node, {defs, Map.put(attrs, :pending_doc, flatten_doc_ast(doc_string)), meta}}
 
         # @spec
         {:@, _, [{:spec, _, spec_ast}]} = node, {defs, attrs, meta} ->
           spec_text = Macro.to_string({:spec, [], spec_ast})
           {node, {defs, Map.put(attrs, :pending_spec, spec_text), meta}}
 
-        # def / defp / defmacro
+        # def / defp / defmacro — with guards (AST wraps head in {:when, _, [head, guard]})
+        {:def, meta_d, [{:when, _, [{name, _, args}, _guard]}, body_list]} = node, {defs, attrs, meta} when is_atom(name) ->
+          def_info = extract_def_info(node, meta_d, name, args || [], module_name, file, "function", attrs, body_list)
+          {node, {[def_info | defs], %{}, meta}}
+
+        {:defp, meta_d, [{:when, _, [{name, _, args}, _guard]}, body_list]} = node, {defs, attrs, meta} when is_atom(name) ->
+          def_info = extract_def_info(node, meta_d, name, args || [], module_name, file, "function_private", attrs, body_list)
+          {node, {[def_info | defs], %{}, meta}}
+
+        {:defmacro, meta_d, [{:when, _, [{name, _, args}, _guard]}, body_list]} = node, {defs, attrs, meta} when is_atom(name) ->
+          def_info = extract_def_info(node, meta_d, name, args || [], module_name, file, "macro", attrs, body_list)
+          {node, {[def_info | defs], %{}, meta}}
+
+        {:defmacrop, meta_d, [{:when, _, [{name, _, args}, _guard]}, body_list]} = node, {defs, attrs, meta} when is_atom(name) ->
+          def_info = extract_def_info(node, meta_d, name, args || [], module_name, file, "macro_private", attrs, body_list)
+          {node, {[def_info | defs], %{}, meta}}
+
+        # def / defp / defmacro — without guards (simple form)
         {:def, meta_d, [{name, _, args}, body_list]} = node, {defs, attrs, meta} when is_atom(name) ->
           def_info = extract_def_info(node, meta_d, name, args || [], module_name, file, "function", attrs, body_list)
           {node, {[def_info | defs], %{}, meta}}
@@ -289,31 +313,31 @@ defmodule Exporter do
     opts = List.last(rest) || []
     from = if is_list(opts), do: Keyword.get(opts, :from, ""), else: ""
     to = if is_list(opts), do: Keyword.get(opts, :to, ""), else: ""
-    "defevent #{event_name} from #{from} to #{to} workflow fsm state_machine"
+    "defevent #{Macro.to_string(event_name)} from #{Macro.to_string(from)} to #{Macro.to_string(to)} workflow fsm state_machine"
   end
 
   defp extract_macro_keywords(:field, [field_name, type | _]) do
-    "field #{field_name} #{inspect(type)} schema ecto"
+    "field #{Macro.to_string(field_name)} #{inspect(type)} schema ecto"
   end
 
   defp extract_macro_keywords(:belongs_to, [assoc_name | _]) do
-    "belongs_to #{assoc_name} association ecto"
+    "belongs_to #{Macro.to_string(assoc_name)} association ecto"
   end
 
   defp extract_macro_keywords(:has_many, [assoc_name | _]) do
-    "has_many #{assoc_name} association ecto"
+    "has_many #{Macro.to_string(assoc_name)} association ecto"
   end
 
   defp extract_macro_keywords(:has_one, [assoc_name | _]) do
-    "has_one #{assoc_name} association ecto"
+    "has_one #{Macro.to_string(assoc_name)} association ecto"
   end
 
   defp extract_macro_keywords(:embeds_one, [assoc_name | _]) do
-    "embeds_one #{assoc_name} embedded ecto"
+    "embeds_one #{Macro.to_string(assoc_name)} embedded ecto"
   end
 
   defp extract_macro_keywords(:embeds_many, [assoc_name | _]) do
-    "embeds_many #{assoc_name} embedded ecto"
+    "embeds_many #{Macro.to_string(assoc_name)} embedded ecto"
   end
 
   defp extract_macro_keywords(:plug, [plug_name | _]) do
@@ -321,6 +345,31 @@ defmodule Exporter do
   end
 
   defp extract_macro_keywords(macro_name, _args), do: to_string(macro_name)
+
+  # Flatten @doc / @moduledoc AST into a plain string.
+  # Handles interpolation AST {:<<>>, _, parts} that appears when @doc
+  # contains #{...} references to module attributes at compile time.
+  def flatten_doc_ast(doc) when is_binary(doc), do: doc
+
+  def flatten_doc_ast({:<<>>, _, parts}) do
+    parts
+    |> Enum.map(fn
+      part when is_binary(part) -> part
+      _ast_part -> "\#{...}"
+    end)
+    |> Enum.join()
+  end
+
+  def flatten_doc_ast({:sigil, _, [{:<<>>, _, parts} | _]}) do
+    parts
+    |> Enum.map(fn
+      part when is_binary(part) -> part
+      _ast_part -> "\#{...}"
+    end)
+    |> Enum.join()
+  end
+
+  def flatten_doc_ast(_other), do: nil
 
   def safe_prewalk_with_state(ast, acc, fun) do
     {ast, acc} = fun.(ast, acc)
@@ -357,7 +406,7 @@ defmodule Exporter do
     lexical_text = lexical_parts |> Enum.reject(&is_nil/1) |> Enum.join(" ")
 
     struct_text = Macro.to_string(node)
-    calls = extract_calls(node)
+    calls = extract_calls(node, module_name, name, arity)
 
     %{
       id: make_id(module_name, name, arity, file),
@@ -377,22 +426,96 @@ defmodule Exporter do
     }
   end
 
-  def extract_calls(node) do
-    Macro.prewalk(node, [], fn
-      {{:., _, [module, func]}, _meta, args} = call, acc when is_list(args) ->
-        mfa = "#{module_to_string(module)}.#{func}/#{length(args)}"
-        {call, [mfa | acc]}
+  # Known Kernel/stdlib functions that are NOT local module calls
+  # Control flow — these are special forms / macros, not real local calls
+  # AST artifacts
+  @kernel_functions MapSet.new(~w(
+    send apply spawn spawn_link self
+    elem tuple_size hd tl length map_size is_atom is_binary is_bitstring is_boolean
+    is_float is_function is_integer is_list is_map is_number is_pid is_port is_reference
+    is_tuple abs div rem max min round trunc byte_size bit_size
+    raise throw exit put_elem put_in get_in update_in pop_in get_and_update_in
+    inspect to_string IO.puts IO.inspect IO.warn
+    is_nil is_exception not and or when
+    build_options call_python
+    case cond with if unless for while try catch rescue after receive
+    do end fn def defp defmodule defmacro defmacrop defguard defstruct
+    defprotocol defimpl require import alias use
+    __aliases__ __block__ __MODULE__ __ENV__ __CALLER__ __DIR__
+  )a)
 
+  # Atom names that are operators / syntax — never real function names
+  @skip_names MapSet.new(~w(
+    -> ++ -- ** ::: .. ... <<>> {} [] %{} ^ @ & <|>
+    != !== == === <= >= <> ~>> <<~ ~> <~ <~> =~
+    || && &&& &&&& <<< >>> <<~ ~> <~> <|> ^^^ <<< >>>
+    |> \\ :: in <-
+  )a)
+
+  def extract_calls(node, module_name \\ nil, self_name \\ nil, self_arity \\ nil) do
+    # mfa of the enclosing def — used to drop self-edges. Every def's HEAD
+    # matches the "bare local call" pattern below, so without this filter every
+    # function would record itself as its own caller (and genuinely dead code
+    # would show exactly one caller: itself). Genuine self-recursion is dropped
+    # too, which is the correct semantics for caller/impact analysis.
+    self_mfa =
+      if module_name && self_name do
+        "#{module_name}.#{self_name}/#{self_arity}"
+      else
+        nil
+      end
+
+    Macro.prewalk(node, [], fn
+      # Explicit module call: Module.function(args) — but only when the dot's
+      # left side is an actual module reference. A variable dot-access like
+      # `state.conn` parses as {{:., _, [{:state, _, _}, :conn]}, _, []} and is
+      # NOT a function call; without this guard it was recorded as "state.conn/0".
+      {{:., _, [module, func]}, _meta, args} = call, acc when is_list(args) ->
+        if module_ref?(module) do
+          resolved = if module == :__MODULE__, do: module_name, else: module_to_string(module)
+          mfa = "#{resolved}.#{func}/#{length(args)}"
+          {call, [mfa | acc]}
+        else
+          {call, acc}
+        end
+
+      # Pipelined local call captured as dot: .function(args)
       {{:., _, [func]}, _meta, args} = call, acc when is_list(args) and is_atom(func) ->
         mfa = "#{func}/#{length(args)}"
         {call, [mfa | acc]}
 
-      node, acc ->
-        {node, acc}
+      # Bare local call: function_name(args) — resolve to module if known
+      {name, _meta, args} = call, acc when is_atom(name) and is_list(args) and not is_nil(module_name) ->
+        name_str = to_string(name)
+        cond do
+          # Skip single-char atoms (operators like :e, :a)
+          byte_size(name_str) <= 1 -> {call, acc}
+          # Skip AST artifacts and control flow
+          MapSet.member?(@kernel_functions, name) -> {call, acc}
+          # Skip operators and syntax
+          MapSet.member?(@skip_names, name) -> {call, acc}
+          # Likely a local call (defp/def in same module) — record as Module.name/arity
+          true ->
+            mfa = "#{module_name}.#{name}/#{length(args)}"
+            {call, [mfa | acc]}
+        end
+
+      call, acc ->
+        {call, acc}
     end)
     |> elem(1)
+    |> Enum.reject(&(&1 == self_mfa))
     |> Enum.uniq()
   end
+
+  # A node in the "module" position of a dotted call is a real module reference
+  # iff it is an alias (Mod), the atom __MODULE__, or a bare module atom (e.g.
+  # :lists, :ets). Variable nodes are 3-tuples {name, meta, ctx} and fall through
+  # to false, which is what we want.
+  defp module_ref?({:__aliases__, _, _}), do: true
+  defp module_ref?(:__MODULE__), do: true
+  defp module_ref?(atom) when is_atom(atom), do: true
+  defp module_ref?(_), do: false
 
   def module_to_string({:__aliases__, _, aliases}) do
     Enum.map_join(aliases, ".", &to_string/1)
