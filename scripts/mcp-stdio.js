@@ -120,7 +120,7 @@ function handleToolsList(id) {
         },
         {
           name: "elixir_context_callers_of",
-          description: "Find all functions that call a given Module.function/arity, with clause-level attribution where resolvable. Queries the call-edge index for reverse lookups. Target forms: bare 'Module.function' (all arities), 'Module.function/2' (exact), or any wildcard ('WorkflowEngine.%', '%.advance_execution%'). Each caller-edge carries its attributed clause ordinal + confidence (attribution: direct|dispatch|ambiguous|null) and dispatch shape (e.g. 'GenServer.call') when the call reaches the target via OTP dispatch. The response also includes target_functions[] with each target's full clause manifest, so a callback with zero indexed callers still surfaces its clause heads.",
+          description: "Find all functions that call a given Module.function/arity, with clause-level attribution where resolvable. Target forms: bare 'Module.function' (all arities), 'Module.function/2' (exact), or any wildcard ('WorkflowEngine.%', '%.advance_execution%'). 'targets[].callers[]' entries carry the legacy fields (module, name, arity, kind, path, line=caller def line, signature) PLUS additive attribution (clause ordinal, clause_signature, attribution: direct|dispatch|ambiguous|null, dispatch e.g. 'GenServer.call', call_line). 'target_functions[]' lists each target's full clause manifest, so a callback with zero indexed callers still surfaces its clause heads.",
           inputSchema: {
             type: "object",
             properties: {
@@ -132,7 +132,7 @@ function handleToolsList(id) {
         },
         {
           name: "elixir_context_calls_from",
-          description: "Find all functions called BY a given function, one edge per call site with clause attribution. Accepts: id (sha256), module+name, or target as 'Module.function' / 'Module.function/arity'. Each returned call carries {callee, clause, attribution (direct|dispatch|ambiguous|null), dispatch, line}.",
+          description: "Find all functions called BY a given function. Accepts: id (sha256), module+name, or target as 'Module.function' / 'Module.function/arity'. Returns 'calls' (bare MFA strings, backward-compatible) AND 'call_sites' (rich objects: {callee, clause, attribution (direct|dispatch|ambiguous|null), dispatch, line}) for clause-level analysis. Prefer 'call_sites'.",
           inputSchema: {
             type: "object",
             properties: {
@@ -457,8 +457,11 @@ function handleCallersOf(params) {
       ? clauseSigByTarget[key][r.dst_clause - 1]
       : null;
     grouped[key].push({
+      // Legacy fields (unchanged meaning): line is the caller's def line.
       module: r.module, name: r.name, arity: r.arity, kind: r.kind,
-      path: r.path, line: r.call_line || r.start_line, signature: r.signature,
+      path: r.path, line: r.start_line, signature: r.signature,
+      // New attribution fields (additive):
+      call_line: r.call_line,            // line of the call site itself
       clause: r.dst_clause,
       clause_signature: clauseSig,
       attribution: r.attribution,
@@ -471,7 +474,8 @@ function handleCallersOf(params) {
     resolved_pattern: target,
     total_matches: rows.length,
     targets: Object.entries(grouped).map(([target, callers]) => ({ target, callers })),
-    target_functions: targetFuncs
+    target_functions: targetFuncs,
+    note: "Each caller carries clause-level attribution when resolvable: clause (ordinal into target_functions[].clauses), clause_signature, attribution (direct|dispatch|ambiguous|null), dispatch (e.g. 'GenServer.call'), and call_line (the call site). 'line' remains the caller's definition line for backward compatibility. target_functions[] lists each target's full clause manifest even when it has zero indexed callers."
   };
 }
 
@@ -517,13 +521,20 @@ function handleCallsFrom(params) {
     ORDER BY e.dst_mfa, e.call_line
     LIMIT ?
   `);
-  const calls = q.all(funcId, k).map(r => ({
+  // Outgoing edges: one row per call site.
+  //   - calls      = bare MFA strings (backward-compatible; legacy shape)
+  //   - call_sites = rich objects {callee, clause, attribution, dispatch, line}
+  //   - note       = inline contract guidance so any caller learns the rich
+  //                  field on first use (no client-version detection possible).
+  const rows = q.all(funcId, k);
+  const call_sites = rows.map(r => ({
     callee: r.callee,
     clause: r.clause,
     attribution: r.attribution,
     dispatch: r.dispatch,
     line: r.line
   }));
+  const calls = rows.map(r => r.callee).filter(Boolean);
 
   return {
     function: {
@@ -532,7 +543,9 @@ function handleCallsFrom(params) {
       signature: funcRow.signature
     },
     calls,
-    total: calls.length
+    call_sites,
+    note: "calls = bare MFA strings (backward-compatible). call_sites = rich objects with {callee, clause, attribution (direct|dispatch|ambiguous|null), dispatch, line} for clause-level analysis. Prefer call_sites.",
+    total: call_sites.length
   };
 }
 
