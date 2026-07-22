@@ -59,7 +59,7 @@ describe('normalizeCallersTarget', () => {
 // --- End-to-end integration: export.exs -> ingest.js -> sqlite ---
 // Covers all three tiers. Skipped automatically when elixir isn't on PATH.
 
-import { spawnSync } from 'child_process';
+import { spawnSync, spawn } from 'child_process';
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -278,5 +278,91 @@ describeIntegration('export -> ingest -> query (all tiers)', () => {
       expect(edge.attribution).toBeNull();
       db.close();
     } finally { rmSync(tmp, { recursive: true }); }
+  });
+});
+
+// --- MCP response shape: backward compatibility + inline guidance ---
+// The upgrade must not break a consumer that learned the old contract, and
+// must tell any caller (LLM) where the richer data lives. We verify this by
+// spawning the real server and inspecting the JSON-RPC responses.
+
+describeIntegration('MCP response shape (backward compatibility + note)', () => {
+  let tmpDir, dbPath, srv;
+
+  function callTool(id, name, args) {
+    srv.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) + '\n');
+  }
+
+  function setup() {
+    tmpDir = mkdtempSync(join(tmpdir(), 'ec-shape-'));
+    mkdirSync(join(tmpDir, 'lib'));
+    writeFileSync(join(tmpDir, 'lib', 'repro.ex'), FIXTURE);
+    dbPath = join(tmpDir, 'ec.sqlite');
+    const jsonl = join(tmpDir, 'export.jsonl');
+    const e = spawnSync('elixir', [join(REPO, 'scripts', 'export.exs'), '--file', join(tmpDir, 'lib', 'repro.ex'), '--quiet', '--out', jsonl], { encoding: 'utf8' });
+    if (e.status !== 0) throw new Error('export failed: ' + e.stderr);
+    const i = spawnSync('node', [join(REPO, 'scripts', 'ingest.js'), jsonl, dbPath], { encoding: 'utf8' });
+    if (i.status !== 0) throw new Error('ingest failed: ' + i.stderr);
+  }
+
+  function startServer() {
+    srv = spawn('node', [join(REPO, 'scripts', 'mcp-stdio.js'), '--db', dbPath], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, PROJECT_ROOT: tmpDir }
+    });
+    srv.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) + '\n');
+  }
+
+  function teardown() { try { srv && srv.kill(); } catch {} try { rmSync(tmpDir, { recursive: true }); } catch {} }
+
+  it('calls_from returns BOTH legacy string calls and rich call_sites, plus a note', async () => {
+    setup(); startServer();
+    const responses = [];
+    srv.stdout.on('data', d => { for (const ln of d.toString().split('\n')) { if (ln.trim()) { try { responses.push(JSON.parse(ln)); } catch {} } } });
+    await new Promise(r => setTimeout(r, 150));
+    callTool(2, 'elixir_context_calls_from', { target: 'GcDaemon.caller_a' });
+    await new Promise(r => setTimeout(r, 400));
+    teardown();
+    const r = responses.find(x => x.id === 2);
+    const body = JSON.parse(r.result.content[0].text);
+    // Legacy contract intact: calls is an array of bare strings.
+    expect(Array.isArray(body.calls)).toBe(true);
+    expect(body.calls.length).toBeGreaterThan(0);
+    expect(typeof body.calls[0]).toBe('string');
+    // Rich contract present: call_sites is objects with attribution fields.
+    expect(Array.isArray(body.call_sites)).toBe(true);
+    expect(body.call_sites.length).toBe(body.calls.length);
+    for (const cs of body.call_sites) {
+      expect(cs).toHaveProperty('callee');
+      expect(cs).toHaveProperty('attribution');
+      expect(cs).toHaveProperty('clause');
+    }
+    // Inline guidance always present.
+    expect(typeof body.note).toBe('string');
+    expect(body.note).toMatch(/call_sites/);
+  });
+
+  it('callers_of preserves line=caller-def-line and adds call_line, clause, attribution', async () => {
+    setup(); startServer();
+    const responses = [];
+    srv.stdout.on('data', d => { for (const ln of d.toString().split('\n')) { if (ln.trim()) { try { responses.push(JSON.parse(ln)); } catch {} } } });
+    await new Promise(r => setTimeout(r, 150));
+    callTool(2, 'elixir_context_callers_of', { target: 'Bee.Repo.handle_call' });
+    await new Promise(r => setTimeout(r, 400));
+    teardown();
+    const body = JSON.parse(responses.find(x => x.id === 2).result.content[0].text);
+    // handle_call is reached via GenServer dispatch from ping_conn/query/vague.
+    const caller = body.targets.flatMap(t => t.callers).find(c => c.attribution === 'dispatch');
+    expect(caller).toBeDefined();
+    // Legacy field meaning preserved: line is the caller's def line.
+    expect(typeof caller.line).toBe('number');
+    // New field: call_line is the call site (>= def line, within the function).
+    expect(caller.call_line).toBeGreaterThanOrEqual(caller.line);
+    expect(caller).toHaveProperty('clause');
+    expect(caller).toHaveProperty('dispatch');
+    expect(typeof body.note).toBe('string');
+    // target_functions carries the full clause manifest even with zero
+    // direct (non-dispatch) callers.
+    expect(body.target_functions[0].clauses.length).toBe(3);
   });
 });
