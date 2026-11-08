@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterAll } from 'vitest';
 
 // --- Pure-function unit tests for normalizeCallersTarget ---
 // Inline copy of the handler logic (mcp-stdio.js is not importable without side
@@ -114,11 +114,16 @@ end
 `;
 
 const hasElixir = elixirAvailable();
-const INTEGRATION_TESTS = 13; // keep in sync when adding/removing integration cases below
-if (!hasElixir) {
-  process.stderr.write(`[tests] elixir not found on PATH; skipping ${INTEGRATION_TESTS} integration tests\n`);
+// Always collect the integration suites so every case is registered; when
+// Elixir is absent each case is skipped individually below. This lets the skip
+// notice report the real number of cases instead of a hand-maintained literal.
+const describeIntegration = describe;
+let integrationTests = 0;
+function itIntegration(name, fn) {
+  integrationTests += 1;
+  if (hasElixir) it(name, fn);
+  else it.skip(name, fn);
 }
-const describeIntegration = hasElixir ? describe : describe.skip;
 
 describeIntegration('export -> ingest -> query (all tiers)', () => {
   let tmpDir, dbPath;
@@ -155,25 +160,25 @@ describeIntegration('export -> ingest -> query (all tiers)', () => {
 
   // ---- Batch 1: stop lying ----
 
-  it('self-edge fix: a genuinely dead function has ZERO callers', () => {
+  itIntegration('self-edge fix: a genuinely dead function has ZERO callers', () => {
     setup(); try { build(); const db = openDb();
       expect(callersOf(db, 'Bee.Repo.totally_dead/%')).toEqual([]);
     db.close(); } finally { teardown(); }
   });
 
-  it('self-edge fix: live function reports only its REAL caller, not itself', () => {
+  itIntegration('self-edge fix: live function reports only its REAL caller, not itself', () => {
     setup(); try { build(); const db = openDb();
       expect(callersOf(db, 'Bee.Repo.enrich_issue/%')).toEqual(['Bee.Repo.sync/1']);
     db.close(); } finally { teardown(); }
   });
 
-  it('dot-call fix: variable field access (state.conn) is not recorded as a call edge', () => {
+  itIntegration('dot-call fix: variable field access (state.conn) is not recorded as a call edge', () => {
     setup(); try { build(); const db = openDb();
       expect(db.prepare(`SELECT count(*) as c FROM edges WHERE dst_mfa LIKE '%state.conn%'`).get().c).toBe(0);
     db.close(); } finally { teardown(); }
   });
 
-  it('bare-target fix: bare LIKE misses, normalization returns real callers', () => {
+  itIntegration('bare-target fix: bare LIKE misses, normalization returns real callers', () => {
     setup(); try { build(); const db = openDb();
       expect(db.prepare(`SELECT count(*) as c FROM edges WHERE dst_mfa LIKE ?`).get('Bee.Repo.enrich_issue').c).toBe(0);
       expect(callersOf(db, 'Bee.Repo.enrich_issue')).toEqual(['Bee.Repo.sync/1']);
@@ -182,7 +187,7 @@ describeIntegration('export -> ingest -> query (all tiers)', () => {
 
   // ---- Tier 1: clause enumeration ----
 
-  it('clause enumeration: multi-clause function emits one clause row per clause', () => {
+  itIntegration('clause enumeration: multi-clause function emits one clause row per clause', () => {
     setup(); try { build(); const db = openDb();
       const clauses = db.prepare(`SELECT c.signature s FROM clauses c JOIN functions f ON f.id = c.function_id
         WHERE f.name = ? ORDER BY c.ordinal`).all('handle_call').map(c => c.s);
@@ -194,7 +199,7 @@ describeIntegration('export -> ingest -> query (all tiers)', () => {
     db.close(); } finally { teardown(); }
   });
 
-  it('clause enumeration: single-clause function still records its one clause', () => {
+  itIntegration('clause enumeration: single-clause function still records its one clause', () => {
     setup(); try { build(); const db = openDb();
       expect(db.prepare(`SELECT count(*) as c FROM clauses c JOIN functions f ON f.id = c.function_id WHERE f.name = ?`).get('enrich_issue').c).toBe(1);
     db.close(); } finally { teardown(); }
@@ -202,7 +207,7 @@ describeIntegration('export -> ingest -> query (all tiers)', () => {
 
   // ---- Tier 2: direct call-site clause attribution ----
 
-  it('Tier 2: direct literal call attributes to the matching clause (first-match-wins)', () => {
+  itIntegration('Tier 2: direct literal call attributes to the matching clause (first-match-wins)', () => {
     setup(); try { build(); const db = openDb();
       // Three call sites into route/1, each resolving to a distinct clause
       // despite the trailing var catch-all clause.
@@ -215,7 +220,7 @@ describeIntegration('export -> ingest -> query (all tiers)', () => {
 
   // ---- Tier 3: OTP dispatch attribution ----
 
-  it('Tier 3: GenServer.call attributes to the specific handle_call clause', () => {
+  itIntegration('Tier 3: GenServer.call attributes to the specific handle_call clause', () => {
     setup(); try { build(); const db = openDb();
       const conn = attributedEdges(db, 'ping_conn', 'Bee.Repo.handle_call/3');
       expect(conn).toHaveLength(1);
@@ -234,7 +239,7 @@ describeIntegration('export -> ingest -> query (all tiers)', () => {
     db.close(); } finally { teardown(); }
   });
 
-  it('Tier 3: dispatch edges all carry the dispatch label (no arity-level noise for handle_call)', () => {
+  itIntegration('Tier 3: dispatch edges all carry the dispatch label (no arity-level noise for handle_call)', () => {
     setup(); try { build(); const db = openDb();
       const noise = db.prepare(`SELECT count(*) as c FROM edges WHERE dst_mfa LIKE '%.handle_call/%' AND attribution IS NULL`).get().c;
       expect(noise).toBe(0);
@@ -243,7 +248,7 @@ describeIntegration('export -> ingest -> query (all tiers)', () => {
 
   // ---- Tier 2 refinement: type-guard evaluation ----
 
-  it('type-guard: is_X guards are evaluated so guarded clauses attribute correctly', () => {
+  itIntegration('type-guard: is_X guards are evaluated so guarded clauses attribute correctly', () => {
     setup(); try { build(); const db = openDb();
       // kind/3 clauses: (1) when is_integer(n), (2) when is_binary(s), (3) catch-all.
       const edges = attributedEdges(db, 'caller_kind', 'GcDaemon.kind/1');
@@ -261,7 +266,7 @@ describeIntegration('export -> ingest -> query (all tiers)', () => {
 
   // ---- Backward compatibility ----
 
-  it('legacy shape: exporter string calls still ingest as arity-level edges', () => {
+  itIntegration('legacy shape: exporter string calls still ingest as arity-level edges', () => {
     const tmp = mkdtempSync(join(tmpdir(), 'ec-legacy-'));
     try {
       const def = {
@@ -320,7 +325,7 @@ describeIntegration('MCP response shape (backward compatibility + note)', () => 
 
   function teardown() { try { srv && srv.kill(); } catch {} try { rmSync(tmpDir, { recursive: true }); } catch {} }
 
-  it('calls_from returns BOTH legacy string calls and rich call_sites, plus a note', async () => {
+  itIntegration('calls_from returns BOTH legacy string calls and rich call_sites, plus a note', async () => {
     setup(); startServer();
     const responses = [];
     srv.stdout.on('data', d => { for (const ln of d.toString().split('\n')) { if (ln.trim()) { try { responses.push(JSON.parse(ln)); } catch {} } } });
@@ -347,7 +352,7 @@ describeIntegration('MCP response shape (backward compatibility + note)', () => 
     expect(body.note).toMatch(/call_sites/);
   });
 
-  it('callers_of preserves line=caller-def-line and adds call_line, clause, attribution', async () => {
+  itIntegration('callers_of preserves line=caller-def-line and adds call_line, clause, attribution', async () => {
     setup(); startServer();
     const responses = [];
     srv.stdout.on('data', d => { for (const ln of d.toString().split('\n')) { if (ln.trim()) { try { responses.push(JSON.parse(ln)); } catch {} } } });
@@ -371,3 +376,9 @@ describeIntegration('MCP response shape (backward compatibility + note)', () => 
     expect(body.target_functions[0].clauses.length).toBe(3);
   });
 });
+
+if (!hasElixir) {
+  afterAll(() => {
+    process.stderr.write(`[tests] elixir not found on PATH; skipping ${integrationTests} integration tests\n`);
+  });
+}
