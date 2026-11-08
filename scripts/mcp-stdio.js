@@ -87,7 +87,7 @@ function handleToolsList(id) {
             properties: {
               query: { type: "string", description: "Search query (supports FTS syntax and plain text)" },
               k: { type: "number", default: 10, description: "Max results to return" },
-              use_ripgrep: { type: "boolean", default: true, description: "Enable ripgrep fallback if FTS returns < 3 results" },
+              use_ripgrep: { type: "boolean", default: true, description: "Enable ripgrep fallback if FTS returns < 2 results" },
               anchor: {
                 type: "object",
                 properties: {

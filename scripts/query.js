@@ -37,7 +37,26 @@ function resolveDb() {
 }
 
 const dbFile = resolveDb();
-const db = new Database(dbFile);
+let db;
+try {
+  db = new Database(dbFile, { fileMustExist: true });
+} catch (err) {
+  console.error(`no index found at ${dbFile}; run \`elixir-context build\` first`);
+  process.exit(1);
+}
+
+const hasIndex = (() => {
+  try {
+    return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'functions_fts'").get();
+  } catch (err) {
+    return null;
+  }
+})();
+if (!hasIndex) {
+  db.close();
+  console.error(`no index found at ${dbFile}; run \`elixir-context build\` first`);
+  process.exit(1);
+}
 
 // FTS query
 const ftsQuery = db.prepare(`

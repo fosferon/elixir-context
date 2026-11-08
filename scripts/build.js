@@ -17,7 +17,7 @@ function getArg(flag, fallback) {
   return fallback;
 }
 
-const projectRoot = getArg('--project', process.env.PROJECT_ROOT || process.cwd());
+const projectRoot = getArg('--project', getArg('--root', process.env.PROJECT_ROOT || process.cwd()));
 const dataDir = getArg('--data', process.env.DATA_DIR || path.join(projectRoot, '.elixir_context'));
 const exporter = getArg('--exporter', process.env.EXPORTER || path.resolve(__dirname, 'export.exs'));
 
