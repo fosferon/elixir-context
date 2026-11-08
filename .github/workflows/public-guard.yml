@@ -31,18 +31,22 @@ jobs:
           PUBLIC_GUARD_REQUIRE_EXTRA: ${{ ((github.event_name == 'push' && !github.event.repository.fork) || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]' && '1' || '' }}
         run: |
           set -euo pipefail
+          # Make sure every existing origin branch is present locally; a known
+          # base is then range-scanned. The hook and CI share this script so
+          # they cannot drift, even though their fallbacks differ.
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             base="${{ github.event.pull_request.base.sha }}"
             head="${{ github.event.pull_request.head.sha }}"
+            bash scripts/public_guard_push_range.sh origin "$base" "$head"
           else
             base="${{ github.event.before }}"
             head="${{ github.sha }}"
+            # CI runs after the push, so --ci scans the whole history when the
+            # base is unusable (new branch or force-push) instead of excluding
+            # the just-pushed branch and scanning nothing.
+            bash scripts/public_guard_push_range.sh --ci origin "$base" "$head"
           fi
-          # Make sure every existing origin branch is present locally. The range
-          # script then excludes everything already published, so a new branch
-          # is judged only on its own commits (the same rule as the pre-push hook).
-          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-          bash scripts/public_guard_push_range.sh origin "$base" "$head"
       - name: Secret scan (full history)
         uses: gitleaks/gitleaks-action@v2
         env:

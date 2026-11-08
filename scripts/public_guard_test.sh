@@ -131,9 +131,10 @@ out=$(hookrun_noextras "$base"); got=$?
 [[ $got -eq 1 ]] || { echo "FAIL: hook without extras misses a built-in leak (exit $got)"; exit 1; }; echo "ok: hook without extras still catches built-in leaks"
 rm -f "$work/x.txt"
 
-# New-branch push: hook and CI must judge only commits not already on the remote.
-# The old public commit deliberately contains a built-in hit, so a whole-history
-# scan fails; the branch's own commits are clean until one plants a term.
+# New-branch push, pre-push ordering: the branch does not exist on the remote
+# yet, so the hook judges only commits not already on the remote. The old public
+# commit deliberately contains a built-in hit, so a whole-history scan fails on
+# it (the pre-rewrite shape); the hook must still ignore it.
 nbrepo="$work/newbranch"
 git init -q "$nbrepo"
 git -C "$nbrepo" config user.email t@t
@@ -153,22 +154,57 @@ addnb lib/new.ex 'defmodule New, do: nil'
 git -C "$nbrepo" commit -qm "clean branch commit"
 nb_head=$(git -C "$nbrepo" rev-parse HEAD)
 nb_zero=0000000000000000000000000000000000000000
-nb_ci() { (cd "$nbrepo" && bash scripts/public_guard_push_range.sh origin "$1" "$nb_head" >/dev/null 2>&1); }
 nb_hook() {
   (cd "$nbrepo" && printf 'refs/heads/feature %s refs/heads/feature %s\n' "$nb_head" "$1" | \
     env -u PUBLIC_GUARD_EXTRA -u PUBLIC_GUARD_REQUIRE_EXTRA -u PUBLIC_GUARD_EXTRA_FILE \
-    HOME="$work/no-home" bash scripts/pre-push origin >/dev/null 2>&1)
+    HOME="$homes/no-home" bash scripts/pre-push origin >/dev/null 2>&1)
 }
-(cd "$nbrepo" && bash scripts/public_guard_commits.sh "$nb_head" >/dev/null 2>&1); got=$?
+(cd "$nbrepo" && env -u PUBLIC_GUARD_EXTRA -u PUBLIC_GUARD_REQUIRE_EXTRA -u PUBLIC_GUARD_EXTRA_FILE \
+  HOME="$homes/no-home" bash scripts/public_guard_commits.sh "$nb_head" >/dev/null 2>&1); got=$?
 [[ $got -eq 1 ]] || { echo "FAIL: whole-history scan should fail on already-public material (exit $got)"; exit 1; }; echo "ok: already-public history trips a whole-history scan"
 nb_hook "$nb_zero"; got=$?; [[ $got -eq 0 ]] || { echo "FAIL: hook rejects a clean new branch with already-public history (exit $got)"; exit 1; }; echo "ok: hook ignores already-public history on a new branch"
-nb_ci "$nb_zero"; got=$?; [[ $got -eq 0 ]] || { echo "FAIL: CI range rejects a clean new branch with already-public history (exit $got)"; exit 1; }; echo "ok: CI range ignores already-public history on a new branch"
 addnb lib/new.ex "host = \"$lan\""
 git -C "$nbrepo" commit -qm "planted branch leak"
 addnb lib/new.ex 'defmodule New, do: nil'
 git -C "$nbrepo" commit -qm "fix planted branch leak"
 nb_head=$(git -C "$nbrepo" rev-parse HEAD)
 nb_hook "$nb_zero"; got=$?; [[ $got -eq 1 ]] || { echo "FAIL: hook misses a planted term in a new branch commit (exit $got)"; exit 1; }; echo "ok: hook catches a planted term in a new branch commit"
-nb_ci "$nb_zero"; got=$?; [[ $got -eq 1 ]] || { echo "FAIL: CI range misses a planted term in a new branch commit (exit $got)"; exit 1; }; echo "ok: CI range catches a planted term in a new branch commit"
+
+# CI ordering: the branch is already on origin when the workflow runs, and the
+# post-rewrite world has no dirty already-public history. With no usable base CI
+# scans the whole history of the pushed head, so it must pass a clean branch and
+# still catch a planted term in an intermediate commit that the tip has fixed.
+cirepo="$work/ci"
+git init -q "$cirepo"
+git -C "$cirepo" config user.email t@t
+git -C "$cirepo" config user.name t
+mkdir -p "$cirepo/scripts"
+cp "$guard" "$cirepo/scripts/public_guard.sh"
+cp "$commits" "$cirepo/scripts/public_guard_commits.sh"
+cp "$range" "$cirepo/scripts/public_guard_push_range.sh"
+addci() { mkdir -p "$(dirname "$cirepo/$1")"; printf '%s\n' "$2" > "$cirepo/$1"; git -C "$cirepo" add "$1"; }
+addci lib/old.ex 'defmodule Old, do: nil'
+git -C "$cirepo" commit -qm "already-public history (post-rewrite, clean)"
+git -C "$cirepo" update-ref refs/remotes/origin/main "$(git -C "$cirepo" rev-parse HEAD)"
+git -C "$cirepo" checkout -qb feature
+addci lib/new.ex 'defmodule New, do: nil'
+git -C "$cirepo" commit -qm "clean branch commit"
+ci_head=$(git -C "$cirepo" rev-parse HEAD)
+ci_zero=0000000000000000000000000000000000000000
+ci() { # ci <base>; the branch is already on origin, as at workflow runtime
+  (cd "$cirepo" && env -u PUBLIC_GUARD_EXTRA -u PUBLIC_GUARD_REQUIRE_EXTRA -u PUBLIC_GUARD_EXTRA_FILE \
+    HOME="$homes/no-home" bash scripts/public_guard_push_range.sh --ci origin "$1" "$ci_head" >/dev/null 2>&1)
+}
+git -C "$cirepo" update-ref refs/remotes/origin/feature "$ci_head"
+ci "$ci_zero"; got=$?; [[ $got -eq 0 ]] || { echo "FAIL: CI rejects a clean new branch with clean public history (exit $got)"; exit 1; }; echo "ok: CI whole-history scan passes a clean new branch"
+ci deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; got=$?; [[ $got -eq 0 ]] || { echo "FAIL: CI rejects a clean branch whose before-SHA is absent (exit $got)"; exit 1; }; echo "ok: CI whole-history scan accepts an unknown before-SHA on a clean branch"
+addci lib/new.ex "host = \"$lan\""
+git -C "$cirepo" commit -qm "planted branch leak"
+addci lib/new.ex 'defmodule New, do: nil'
+git -C "$cirepo" commit -qm "fix planted branch leak"
+ci_head=$(git -C "$cirepo" rev-parse HEAD)
+git -C "$cirepo" update-ref refs/remotes/origin/feature "$ci_head"
+ci "$ci_zero"; got=$?; [[ $got -eq 1 ]] || { echo "FAIL: CI misses a planted term in an intermediate branch commit (exit $got)"; exit 1; }; echo "ok: CI whole-history scan catches a planted term in an intermediate branch commit"
+ci deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; got=$?; [[ $got -eq 1 ]] || { echo "FAIL: CI misses a planted term when the before-SHA is absent (exit $got)"; exit 1; }; echo "ok: CI whole-history scan catches a planted term with an unknown before-SHA"
 
 echo "public_guard_test: all passed"
