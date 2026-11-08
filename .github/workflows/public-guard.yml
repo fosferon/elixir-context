@@ -6,7 +6,19 @@ permissions:
   contents: read
 jobs:
   guard:
+    # A branch-deletion push publishes nothing, so there is nothing to scan
+    # (the pre-push hook skips deletions the same way).
+    if: github.event_name != 'push' || !github.event.deleted
     runs-on: ubuntu-latest
+    env:
+      # When extras are required, defined once for both guard steps. The secret
+      # itself is passed only to the steps that read it, never to third-party
+      # actions. Secrets are absent on pull requests from forks; there the
+      # built-in patterns still run, and the push to the default branch
+      # (master) afterwards runs the full set. Fork pushes need no extras;
+      # canonical pushes do under any owner or name. Dependabot runs receive
+      # no secrets, so they use the built-in patterns only.
+      PUBLIC_GUARD_REQUIRE_EXTRA: ${{ ((github.event_name == 'push' && !github.event.repository.fork) || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]' && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -16,19 +28,10 @@ jobs:
       - name: Content guard
         env:
           PUBLIC_GUARD_EXTRA: ${{ secrets.PUBLIC_GUARD_EXTRA }}
-          # Secrets are absent on pull requests from forks; there the built-in
-          # patterns still run, and the push to the default branch (master)
-          # afterwards runs the full set.
-          # Fork pushes need no extras; canonical pushes do under any owner or name.
-          # Dependabot runs receive no secrets, so they use the built-in patterns only.
-          PUBLIC_GUARD_REQUIRE_EXTRA: ${{ ((github.event_name == 'push' && !github.event.repository.fork) || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]' && '1' || '' }}
         run: bash scripts/public_guard.sh
       - name: Content guard (pushed range)
         env:
           PUBLIC_GUARD_EXTRA: ${{ secrets.PUBLIC_GUARD_EXTRA }}
-          # Same requirement as the tip guard: canonical pushes and same-repo PRs
-          # must provide extras; forks and Dependabot run with built-ins only.
-          PUBLIC_GUARD_REQUIRE_EXTRA: ${{ ((github.event_name == 'push' && !github.event.repository.fork) || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]' && '1' || '' }}
         run: |
           set -euo pipefail
           # Make sure every existing origin branch is present locally; a known

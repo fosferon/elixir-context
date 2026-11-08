@@ -2,6 +2,9 @@
 # Fixture test for public_guard.sh: every pattern class must still trip, and a
 # clean tree must pass, so that editing a pattern cannot silently disable it.
 set -uo pipefail
+# Hermetic: the caller's guard settings (CI sets PUBLIC_GUARD_REQUIRE_EXTRA at
+# job level) must not leak into cases that set their own.
+unset PUBLIC_GUARD_EXTRA PUBLIC_GUARD_REQUIRE_EXTRA PUBLIC_GUARD_EXTRA_FILE
 guard="$(cd "$(dirname "$0")" && pwd)/public_guard.sh"
 commits="$(cd "$(dirname "$0")" && pwd)/public_guard_commits.sh"
 range="$(cd "$(dirname "$0")" && pwd)/public_guard_push_range.sh"
@@ -101,7 +104,7 @@ if [[ $got -eq 0 || "$out" != *"public-guard fixture: simulated ls-files failure
   echo "FAIL: failing git ls-files must fail closed (exit $got; output: $out)"; exit 1
 fi
 echo "ok: failing git ls-files fails closed"
-rm -rf "$work/bin"
+rm -rf "${work:?}/bin"
 
 # pre-push hook: every pushed commit is scanned, not only the tip.
 reset; add lib/a.ex 'defmodule A, do: nil'; git commit -qm base; base=$(git rev-parse HEAD)
