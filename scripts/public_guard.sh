@@ -4,9 +4,10 @@
 # Scans every tracked file for personal paths, private addresses, internal issue
 # references and AI-tool/working-paper artefacts. Extra patterns that must not
 # themselves be published (client names) are read from PUBLIC_GUARD_EXTRA
-# (one ERE per line) or from $PUBLIC_GUARD_EXTRA_FILE. Entries are extended
-# regular expressions, so regex metacharacters in a name can over-match. Exit 1
-# on any finding.
+# (one ERE per line), $PUBLIC_GUARD_EXTRA_FILE, or the default
+# $HOME/.config/fosferon/public-guard-extra.txt when neither is set and that
+# file exists. Entries are extended regular expressions, so regex metacharacters
+# in a name can over-match. Exit 1 on any finding.
 #
 # PUBLIC_GUARD_REQUIRE_EXTRA=1 makes a missing or empty extra-pattern list an error
 # instead of a silent skip; CI and the pre-push hook set it.
@@ -42,6 +43,14 @@ if [[ -z "$extra" && -n "${PUBLIC_GUARD_EXTRA_FILE:-}" ]]; then
     extra="$(cat "$PUBLIC_GUARD_EXTRA_FILE")"
   else
     echo "public_guard: PUBLIC_GUARD_EXTRA_FILE is set but not readable"; fail=1
+  fi
+elif [[ -z "$extra" && -z "${PUBLIC_GUARD_EXTRA_FILE:-}" ]]; then
+  # Same default as the pre-push hook, so a direct guard run loads the local
+  # extras just as a push does. An explicitly set non-empty file still wins; an
+  # empty one counts as unset, as it does in the hook.
+  default_extra="${HOME:-}/.config/fosferon/public-guard-extra.txt"
+  if [[ -r "$default_extra" ]]; then
+    extra="$(cat "$default_extra")"
   fi
 fi
 while IFS= read -r p; do

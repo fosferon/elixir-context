@@ -6,12 +6,14 @@ guard="$(cd "$(dirname "$0")" && pwd)/public_guard.sh"
 commits="$(cd "$(dirname "$0")" && pwd)/public_guard_commits.sh"
 range="$(cd "$(dirname "$0")" && pwd)/public_guard_push_range.sh"
 hook="$(cd "$(dirname "$0")/.." && pwd)/.githooks/pre-push"
-work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+work=$(mktemp -d); homes=$(mktemp -d); trap 'rm -rf "$work" "$homes"' EXIT
+mkdir -p "$homes/empty"
 cd "$work" && git init -q . && git config user.email t@t && git config user.name t
 mkdir scripts && cp "$guard" scripts/public_guard.sh && cp "$commits" scripts/public_guard_commits.sh && cp "$range" scripts/public_guard_push_range.sh
 
 expect() { # expect <0|1> <description>
   PUBLIC_GUARD_EXTRA="${EXTRA:-}" PUBLIC_GUARD_REQUIRE_EXTRA="${REQUIRE:-}" PUBLIC_GUARD_EXTRA_FILE="${XFILE:-}" \
+    HOME="${THOME:-$homes/empty}" \
     bash scripts/public_guard.sh >/dev/null 2>&1; got=$?
   if [[ $got -ne $1 ]]; then echo "FAIL: $2 (exit $got, expected $1)"; exit 1; fi
   echo "ok: $2"
@@ -57,12 +59,20 @@ XFILE=''
 reset; add READINESS.md "x"; add DEVELOPMENT.md "y";                    expect 0 "READINESS and DEVELOPMENT are standard files"
 EXTRA=""
 
+# The default extras path is used only when neither extras variable is set; all
+# other fixture runs point HOME at an empty directory, so they never load it.
+mkdir -p "$homes/default/.config/fosferon"
+printf 'acmecorp\r\n' > "$homes/default/.config/fosferon/public-guard-extra.txt"
+reset; add lib/a.ex 'client = "Acmecorp"'; THOME="$homes/default"       expect 1 "default extras file is picked up"
+reset; add lib/a.ex 'defmodule A, do: nil'; THOME="$homes/default" REQUIRE=1 expect 0 "required extras load from the default file"
+THOME=''; REQUIRE=''
+
 # Fail closed: no work tree, or nothing tracked, must never report clean.
 rm -f scripts/public_guard_commits.sh scripts/public_guard_push_range.sh   # leave the guard as the only tracked file
 reset;                                                                  expect 1 "tree with only the guard tracked fails closed"
 reset; git rm -rq --cached .;                                           expect 1 "zero tracked files fails closed"
 nonrepo=$(mktemp -d)
-outside=$(cd "$nonrepo" && PUBLIC_GUARD_EXTRA='' PUBLIC_GUARD_REQUIRE_EXTRA='' PUBLIC_GUARD_EXTRA_FILE='' \
+outside=$(cd "$nonrepo" && PUBLIC_GUARD_EXTRA='' PUBLIC_GUARD_REQUIRE_EXTRA='' PUBLIC_GUARD_EXTRA_FILE='' HOME="$homes/empty" \
   bash "$guard" 2>&1); got=$?
 rm -rf "$nonrepo"
 if [[ $got -eq 0 || "$outside" != *"not inside a git work tree"* ]]; then
@@ -85,7 +95,7 @@ done
 exec "$real_git" "\$@"
 EOF
 chmod +x "$work/bin/git"
-out=$(PATH="$work/bin:$PATH" PUBLIC_GUARD_EXTRA='' PUBLIC_GUARD_REQUIRE_EXTRA='' PUBLIC_GUARD_EXTRA_FILE='' \
+out=$(PATH="$work/bin:$PATH" PUBLIC_GUARD_EXTRA='' PUBLIC_GUARD_REQUIRE_EXTRA='' PUBLIC_GUARD_EXTRA_FILE='' HOME="$homes/empty" \
   bash scripts/public_guard.sh 2>&1); got=$?
 if [[ $got -eq 0 || "$out" != *"public-guard fixture: simulated ls-files failure"* || "$out" == *"public_guard: clean"* || "$out" == *"no scannable tracked files"* ]]; then
   echo "FAIL: failing git ls-files must fail closed (exit $got; output: $out)"; exit 1
@@ -107,7 +117,7 @@ hookrun() { echo "refs/heads/main $(git rev-parse HEAD) refs/heads/main $1" | \
 hookrun_noextras() {
   echo "refs/heads/main $(git rev-parse HEAD) refs/heads/main $1" | \
     env -u PUBLIC_GUARD_EXTRA -u PUBLIC_GUARD_REQUIRE_EXTRA -u PUBLIC_GUARD_EXTRA_FILE \
-    HOME="$work/no-home" bash scripts/pre-push origin 2>&1
+    HOME="$homes/no-home" bash scripts/pre-push origin 2>&1
 }
 printf 'acmecorp\r\n' > "$work/x.txt"   # CRLF extras file must still load
 hookrun "$base"; got=$?; [[ $got -eq 1 ]] || { echo "FAIL: hook misses a leak in an intermediate commit (exit $got)"; exit 1; }; echo "ok: hook scans intermediate commits"
