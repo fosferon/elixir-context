@@ -1,6 +1,20 @@
 {
   "name": "elixir-context",
   "private": true,
+  "version": "0.1.0",
+  "description": "Semantic and call-graph context for Elixir codebases, exposed to coding CLIs over MCP.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fosferon/elixir-context.git"
+  },
+  "homepage": "https://github.com/fosferon/elixir-context#readme",
+  "bugs": {
+    "url": "https://github.com/fosferon/elixir-context/issues"
+  },
   "bin": {
     "elixir-context": "bin/elixir-context.js"
   },
@@ -20,5 +34,22 @@
   },
   "devDependencies": {
     "vitest": "^1.6.0"
-  }
+  },
+  "files": [
+    "bin/",
+    "scripts/build.js",
+    "scripts/export.exs",
+    "scripts/ingest.js",
+    "scripts/logger.js",
+    "scripts/mcp-stdio.js",
+    "scripts/parse-heex.js",
+    "scripts/query.js",
+    "scripts/ripgrep-search.js",
+    "scripts/start-with-watch.sh",
+    "scripts/utils.js",
+    "scripts/watch.js",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ]
 }
