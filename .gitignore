@@ -18,6 +18,7 @@ knowledge/
 
 # Internal working notes kept out of the public tree
 MIGRATION.md
+audit-round*.md
 
 # OS noise
 .DS_Store
