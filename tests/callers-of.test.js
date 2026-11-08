@@ -113,7 +113,12 @@ defmodule GcDaemon do
 end
 `;
 
-const describeIntegration = elixirAvailable() ? describe : describe.skip;
+const hasElixir = elixirAvailable();
+const INTEGRATION_TESTS = 13; // keep in sync when adding/removing integration cases below
+if (!hasElixir) {
+  process.stderr.write(`[tests] elixir not found on PATH; skipping ${INTEGRATION_TESTS} integration tests\n`);
+}
+const describeIntegration = hasElixir ? describe : describe.skip;
 
 describeIntegration('export -> ingest -> query (all tiers)', () => {
   let tmpDir, dbPath;
