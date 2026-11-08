@@ -19,9 +19,22 @@ cleanup() {
   if [[ -n "$wt" ]]; then
     git worktree remove -f "$wt" 2>/dev/null || true
     rm -rf "$wt" "$wt.log"
+    wt=""
   fi
 }
-trap cleanup EXIT
+finish() {
+  local code=${1:-$?}
+  trap - EXIT INT TERM
+  cleanup
+  exit "$code"
+}
+trap finish EXIT
+trap 'finish 130' INT
+trap 'finish 143' TERM
+
+# Drop registrations left by a run that was killed before its EXIT trap could
+# remove them, before adding another worktree.
+git worktree prune 2>/dev/null || true
 
 if [[ $# -eq 0 ]]; then
   echo "usage: public_guard_commits.sh <rev-list args>..." >&2
