@@ -32,8 +32,10 @@ trap finish EXIT
 trap 'finish 130' INT
 trap 'finish 143' TERM
 
-# Drop registrations left by a run that was killed before its EXIT trap could
-# remove them, before adding another worktree.
+# Drop stale registrations whose worktree directory is already gone (for example
+# after the OS temp reaper removed it), before adding another worktree. A run
+# killed while its directory still exists keeps both the directory and the
+# registration; prune does not remove it.
 git worktree prune 2>/dev/null || true
 
 if [[ $# -eq 0 ]]; then

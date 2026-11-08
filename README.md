@@ -136,9 +136,11 @@ git config core.hooksPath .githooks
 The hook scans every commit being pushed. Built-in patterns always run. If
 `PUBLIC_GUARD_EXTRA_FILE` is set, or `~/.config/fosferon/public-guard-extra.txt`
 exists, the hook also checks those client-name extras and fails if they cannot
-be loaded; otherwise it prints that extras were not checked. CI always supplies
-the extras from a repository secret. Extra entries are extended regular
-expressions, so escape any regex metacharacters in a name.
+be loaded; otherwise it prints that extras were not checked. CI supplies the
+extras from a repository secret on canonical pushes and same-repo pull
+requests; fork pull requests and Dependabot runs check the built-in patterns
+only. Extra entries are extended regular expressions, so escape any regex
+metacharacters in a name.
 
 ## License
 
