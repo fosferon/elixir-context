@@ -1,1 +1,23 @@
-node_modules
+# Node dependencies and logs
+node_modules/
+npm-debug.log*
+*.log
+
+# Index and build output
+.elixir_context/
+*.sqlite
+*.sqlite3
+coverage/
+
+# Local runtime data
+venv/
+.venv/
+sessions/
+.knowledge/
+knowledge/
+
+# Internal working notes kept out of the public tree
+MIGRATION.md
+
+# OS noise
+.DS_Store

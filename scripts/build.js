@@ -4,8 +4,8 @@
 // Usage:
 //   elixir-context build --project <project_root> --data <data_dir> [--exporter <export_exs>]
 // Examples:
-//   elixir-context build --project ~/Sites/REDACTED/REDACTED_umbrella --data ~/Sites/REDACTED/REDACTED_umbrella/.elixir_context
-//   elixir-context build --project ~/Sites/REDACTED --data ~/Sites/REDACTED/.elixir_context --exporter ~/Sites/REDACTED/orchestrator/priv/export.exs
+//   elixir-context build --project ~/code/my_app --data ~/code/my_app/.elixir_context
+//   elixir-context build --project ~/code/my_app --data ~/code/my_app/.elixir_context --exporter ~/code/my_app/priv/export.exs
 
 const { spawnSync } = require('child_process');
 const path = require('path');

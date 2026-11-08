@@ -10,16 +10,16 @@ const crypto = require('crypto');
 function parseHeexFile(filePath, content) {
   const results = [];
 
-  // Extract module name from file path (e.g., lib/REDACTED_web/live/company_live/index.html.heex -> REDACTEDWeb.CompanyLive.Index)
+  // Extract module name from file path (e.g., lib/my_app_web/live/user_live/index.html.heex -> MyAppWeb.UserLive.Index)
   const moduleName = extractModuleName(filePath);
 
   // Extract components like <.modal>, <.form>, <.live_component>
   const components = extractComponents(content);
 
-  // Extract assigns like @user, @socket, @company
+  // Extract assigns like @user, @socket, @account
   const assigns = extractAssigns(content);
 
-  // Extract function calls like Routes.company_path(@socket, :index)
+  // Extract function calls like Routes.account_path(@socket, :index)
   const functionCalls = extractFunctionCalls(content);
 
   // Build searchable lexical text
@@ -57,8 +57,8 @@ function parseHeexFile(filePath, content) {
 }
 
 function extractModuleName(filePath) {
-  // Convert path like lib/REDACTED_web/live/company_live/index.html.heex
-  // to REDACTEDWeb.CompanyLive.Index
+  // Convert path like lib/my_app_web/live/user_live/index.html.heex
+  // to MyAppWeb.UserLive.Index
   const match = filePath.match(/lib\/([^\/]+)\/(.+)\.html\.heex$/);
   if (!match) return 'Template';
 
