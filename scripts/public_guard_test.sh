@@ -4,10 +4,11 @@
 set -uo pipefail
 guard="$(cd "$(dirname "$0")" && pwd)/public_guard.sh"
 commits="$(cd "$(dirname "$0")" && pwd)/public_guard_commits.sh"
+range="$(cd "$(dirname "$0")" && pwd)/public_guard_push_range.sh"
 hook="$(cd "$(dirname "$0")/.." && pwd)/.githooks/pre-push"
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 cd "$work" && git init -q . && git config user.email t@t && git config user.name t
-mkdir scripts && cp "$guard" scripts/public_guard.sh && cp "$commits" scripts/public_guard_commits.sh
+mkdir scripts && cp "$guard" scripts/public_guard.sh && cp "$commits" scripts/public_guard_commits.sh && cp "$range" scripts/public_guard_push_range.sh
 
 expect() { # expect <0|1> <description>
   PUBLIC_GUARD_EXTRA="${EXTRA:-}" PUBLIC_GUARD_REQUIRE_EXTRA="${REQUIRE:-}" PUBLIC_GUARD_EXTRA_FILE="${XFILE:-}" \
@@ -57,7 +58,7 @@ reset; add READINESS.md "x"; add DEVELOPMENT.md "y";                    expect 0
 EXTRA=""
 
 # Fail closed: no work tree, or nothing tracked, must never report clean.
-rm -f scripts/public_guard_commits.sh   # leave the guard as the only tracked file
+rm -f scripts/public_guard_commits.sh scripts/public_guard_push_range.sh   # leave the guard as the only tracked file
 reset;                                                                  expect 1 "tree with only the guard tracked fails closed"
 reset; git rm -rq --cached .;                                           expect 1 "zero tracked files fails closed"
 nonrepo=$(mktemp -d)
@@ -98,6 +99,7 @@ add lib/a.ex "host = \"$lan\""; git commit -qm leak
 add lib/a.ex 'defmodule A, do: nil'; git commit -qm fix
 cp "$hook" scripts/pre-push
 cp "$commits" scripts/public_guard_commits.sh
+cp "$range" scripts/public_guard_push_range.sh
 hookrun() { echo "refs/heads/main $(git rev-parse HEAD) refs/heads/main $1" | \
   PUBLIC_GUARD_EXTRA_FILE="$work/x.txt" bash scripts/pre-push origin >/dev/null 2>&1; }
 # No extras configured and no default file: the hook must still scan built-ins and
@@ -118,4 +120,45 @@ out=$(hookrun_noextras "$(git rev-parse HEAD~1)"); got=$?
 out=$(hookrun_noextras "$base"); got=$?
 [[ $got -eq 1 ]] || { echo "FAIL: hook without extras misses a built-in leak (exit $got)"; exit 1; }; echo "ok: hook without extras still catches built-in leaks"
 rm -f "$work/x.txt"
+
+# New-branch push: hook and CI must judge only commits not already on the remote.
+# The old public commit deliberately contains a built-in hit, so a whole-history
+# scan fails; the branch's own commits are clean until one plants a term.
+nbrepo="$work/newbranch"
+git init -q "$nbrepo"
+git -C "$nbrepo" config user.email t@t
+git -C "$nbrepo" config user.name t
+mkdir -p "$nbrepo/scripts"
+cp "$guard" "$nbrepo/scripts/public_guard.sh"
+cp "$commits" "$nbrepo/scripts/public_guard_commits.sh"
+cp "$range" "$nbrepo/scripts/public_guard_push_range.sh"
+cp "$hook" "$nbrepo/scripts/pre-push"
+addnb() { mkdir -p "$(dirname "$nbrepo/$1")"; printf '%s\n' "$2" > "$nbrepo/$1"; git -C "$nbrepo" add "$1"; }
+addnb lib/old.ex "path = \"/Us""ers/someone/old\""
+git -C "$nbrepo" commit -qm "already-public history"
+git -C "$nbrepo" update-ref refs/remotes/origin/main "$(git -C "$nbrepo" rev-parse HEAD)"
+git -C "$nbrepo" checkout -qb feature
+addnb lib/old.ex 'defmodule Old, do: nil'
+addnb lib/new.ex 'defmodule New, do: nil'
+git -C "$nbrepo" commit -qm "clean branch commit"
+nb_head=$(git -C "$nbrepo" rev-parse HEAD)
+nb_zero=0000000000000000000000000000000000000000
+nb_ci() { (cd "$nbrepo" && bash scripts/public_guard_push_range.sh origin "$1" "$nb_head" >/dev/null 2>&1); }
+nb_hook() {
+  (cd "$nbrepo" && printf 'refs/heads/feature %s refs/heads/feature %s\n' "$nb_head" "$1" | \
+    env -u PUBLIC_GUARD_EXTRA -u PUBLIC_GUARD_REQUIRE_EXTRA -u PUBLIC_GUARD_EXTRA_FILE \
+    HOME="$work/no-home" bash scripts/pre-push origin >/dev/null 2>&1)
+}
+(cd "$nbrepo" && bash scripts/public_guard_commits.sh "$nb_head" >/dev/null 2>&1); got=$?
+[[ $got -eq 1 ]] || { echo "FAIL: whole-history scan should fail on already-public material (exit $got)"; exit 1; }; echo "ok: already-public history trips a whole-history scan"
+nb_hook "$nb_zero"; got=$?; [[ $got -eq 0 ]] || { echo "FAIL: hook rejects a clean new branch with already-public history (exit $got)"; exit 1; }; echo "ok: hook ignores already-public history on a new branch"
+nb_ci "$nb_zero"; got=$?; [[ $got -eq 0 ]] || { echo "FAIL: CI range rejects a clean new branch with already-public history (exit $got)"; exit 1; }; echo "ok: CI range ignores already-public history on a new branch"
+addnb lib/new.ex "host = \"$lan\""
+git -C "$nbrepo" commit -qm "planted branch leak"
+addnb lib/new.ex 'defmodule New, do: nil'
+git -C "$nbrepo" commit -qm "fix planted branch leak"
+nb_head=$(git -C "$nbrepo" rev-parse HEAD)
+nb_hook "$nb_zero"; got=$?; [[ $got -eq 1 ]] || { echo "FAIL: hook misses a planted term in a new branch commit (exit $got)"; exit 1; }; echo "ok: hook catches a planted term in a new branch commit"
+nb_ci "$nb_zero"; got=$?; [[ $got -eq 1 ]] || { echo "FAIL: CI range misses a planted term in a new branch commit (exit $got)"; exit 1; }; echo "ok: CI range catches a planted term in a new branch commit"
+
 echo "public_guard_test: all passed"

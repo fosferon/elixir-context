@@ -31,7 +31,6 @@ jobs:
           PUBLIC_GUARD_REQUIRE_EXTRA: ${{ ((github.event_name == 'push' && !github.event.repository.fork) || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]' && '1' || '' }}
         run: |
           set -euo pipefail
-          zero=0000000000000000000000000000000000000000
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             base="${{ github.event.pull_request.base.sha }}"
             head="${{ github.event.pull_request.head.sha }}"
@@ -39,16 +38,11 @@ jobs:
             base="${{ github.event.before }}"
             head="${{ github.sha }}"
           fi
-          if [[ -z "$head" || "$head" == "$zero" ]]; then
-            echo "public guard: no head commit to scan" >&2
-            exit 1
-          fi
-          if [[ -z "$base" || "$base" == "$zero" ]]; then
-            # New branch: its whole history is newly reachable, so scan all of it.
-            bash scripts/public_guard_commits.sh "$head"
-          else
-            bash scripts/public_guard_commits.sh "$base..$head"
-          fi
+          # Make sure every existing origin branch is present locally. The range
+          # script then excludes everything already published, so a new branch
+          # is judged only on its own commits (the same rule as the pre-push hook).
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          bash scripts/public_guard_push_range.sh origin "$base" "$head"
       - name: Secret scan (full history)
         uses: gitleaks/gitleaks-action@v2
         env:
